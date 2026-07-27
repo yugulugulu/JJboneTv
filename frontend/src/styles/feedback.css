@@ -1,0 +1,29 @@
+.loading-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
+  color: #8d95a3;
+  font-size: 12px;
+  background: #0b0d10;
+}
+
+.loading-screen p {
+  margin: 0;
+}
+
+.loading-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #30333a;
+  border-top-color: #f3a16a;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
