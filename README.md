@@ -21,7 +21,7 @@ cp .env.development.example .env.development
 docker compose --env-file .env.development up --build -d
 ```
 
-真实的 `.env.development` 和 `.env.production` 均被 Git 忽略，仓库只保留带注释的模板。用户前端默认映射宿主机 3001 端口，管理员前端默认映射 3002 端口；需要覆盖时修改当前环境文件中的 `FRONTEND_PORT` 和 `ADMIN_FRONTEND_PORT`。
+真实的 `.env.development` 和 `.env.production` 均被 Git 忽略，仓库只保留带注释的模板。用户前端默认映射宿主机 `127.0.0.1:3001`，管理员前端默认映射 `127.0.0.1:3002`；需要覆盖时修改当前环境文件中的 `FRONTEND_PORT` 和 `ADMIN_FRONTEND_PORT`。生产公网入口由服务器外层 Nginx 提供，容器端口不直接暴露到公网。
 
 查看服务状态：
 
@@ -42,6 +42,65 @@ docker compose --env-file .env.development logs migration worker
 ```bash
 docker compose --env-file .env.development down
 ```
+
+## 生产域名与外层 Nginx
+
+生产环境使用两个域名，并保持浏览器页面与对应 API 同源：
+
+- `https://app.jjbone.fun` 转发到用户前端 `127.0.0.1:3001`，容器内 Nginx再把 `/api/` 转发到用户后端。
+- `https://admin.jjbone.fun` 转发到管理前端 `127.0.0.1:3002`，容器内 Nginx再把 `/admin-api/` 转发到管理后端。
+
+React 和 FastAPI 业务代码不需要写死域名。两个前端都使用相对 API 路径，因此生产域名、TLS 证书和 HTTP 到 HTTPS 跳转统一由服务器外层 Nginx 管理。
+
+先在 DNS 服务商处把 `app.jjbone.fun` 和 `admin.jjbone.fun` 的 A 记录指向生产服务器公网 IPv4 地址。若服务器没有配置 IPv6，不要添加 AAAA 记录。服务器安全组和防火墙只需对公网开放 `80/tcp`、`443/tcp` 和受限来源的 SSH 端口，不要开放 `3001`、`3002`、`5432`、`8000` 或 `8001`。
+
+以 Ubuntu/Debian 为例，首次申请证书前安装 Nginx 和 Certbot：
+
+```bash
+sudo apt update
+sudo apt install -y nginx certbot
+sudo mkdir -p /var/www/certbot
+sudo cp deploy/nginx/thinktv-http.conf /etc/nginx/sites-available/thinktv
+sudo ln -s /etc/nginx/sites-available/thinktv /etc/nginx/sites-enabled/thinktv
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+DNS 生效且两个域名的 80 端口都能访问后，为两个域名签发同一张证书。第一个域名同时作为固定证书名称，因此最终 Nginx 配置中的证书目录为 `/etc/letsencrypt/live/app.jjbone.fun/`：
+
+```bash
+sudo certbot certonly \
+  --webroot -w /var/www/certbot \
+  --cert-name app.jjbone.fun \
+  -d app.jjbone.fun \
+  -d admin.jjbone.fun
+```
+
+签发完成后替换为正式 HTTPS 配置：
+
+```bash
+sudo cp deploy/nginx/thinktv.conf /etc/nginx/sites-available/thinktv
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot renew --dry-run
+```
+
+最后启动生产容器并检查入口：
+
+```bash
+docker compose --env-file .env.production up --build -d
+docker compose --env-file .env.production ps
+curl -I https://app.jjbone.fun
+curl -I https://admin.jjbone.fun
+curl https://app.jjbone.fun/api/health
+curl https://admin.jjbone.fun/admin-api/health
+```
+
+仓库中的两个外层配置分别用于不同阶段：
+
+- `deploy/nginx/thinktv-http.conf`：首次申请证书前使用，保留 HTTP 访问和 ACME challenge。
+- `deploy/nginx/thinktv.conf`：证书签发后使用，提供 HTTPS、HTTP 跳转和两个域名的反向代理。
 
 ## 接入模型 API
 

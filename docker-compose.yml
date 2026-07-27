@@ -106,7 +106,8 @@ services:
     build:
       context: ./frontend
     ports:
-      - "${FRONTEND_PORT:?FRONTEND_PORT is required}:80"
+      # 前端只暴露给宿主机，由服务器外层 Nginx 提供公网 80/443 入口。
+      - "127.0.0.1:${FRONTEND_PORT:?FRONTEND_PORT is required}:80"
     depends_on:
       backend:
         condition: service_healthy
@@ -141,7 +142,8 @@ services:
     build:
       context: ./admin-frontend
     ports:
-      - "${ADMIN_FRONTEND_PORT:?ADMIN_FRONTEND_PORT is required}:80"
+      # 管理端只暴露给宿主机，禁止绕过外层 HTTPS 入口直接公网访问。
+      - "127.0.0.1:${ADMIN_FRONTEND_PORT:?ADMIN_FRONTEND_PORT is required}:80"
     depends_on:
       admin-backend:
         condition: service_healthy
