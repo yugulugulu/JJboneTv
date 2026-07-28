@@ -240,7 +240,7 @@ def validate_runtime_settings(role: str, config: Settings = settings) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="ThinkTV 运行时配置校验")
+    parser = argparse.ArgumentParser(description="JJboneTv 运行时配置校验")
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("role", choices=("user-api", "admin-api", "worker", "migration"))

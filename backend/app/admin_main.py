@@ -35,7 +35,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ThinkTV Admin API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="JJboneTv Admin API", version="0.1.0", lifespan=lifespan)
 app.include_router(admin_router)
 
 

@@ -179,7 +179,7 @@ export function StudioPage() {
         ref={frameRef}
         className="studio-frame"
         src={`/studio.html?v=${STUDIO_FRAME_VERSION}`}
-        title="ThinkAI Studio 创作工作台"
+        title="JJboneTv 创作工作台"
         onLoad={handleFrameLoad}
       />
     </main>

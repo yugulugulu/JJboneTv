@@ -2,12 +2,12 @@ import { BrandMark } from './BrandMark'
 
 export function AuthVisual() {
   return (
-    <section className="auth-visual" aria-label="ThinkAI Studio 品牌展示">
+    <section className="auth-visual" aria-label="JJboneTv 品牌展示">
       <div className="auth-visual-shade" />
 
       <header className="auth-brand">
         <BrandMark />
-        <span>ThinkAI Studio</span>
+        <span>JJboneTv</span>
       </header>
 
       <div className="auth-story">

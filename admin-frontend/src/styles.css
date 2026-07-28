@@ -35,6 +35,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 
 .brand-mark { width: 42px; height: 42px; display: grid; place-items: center; border: 1px solid #43504a; border-radius: 8px; background: #1c2521; color: var(--accent); box-shadow: inset 0 1px rgba(255,255,255,.04); flex: none; }
 .brand-mark.compact { width: 34px; height: 34px; border-radius: 7px; }
+.brand-mark img { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
 
 .login-page { min-height: 100vh; display: grid; grid-template-columns: minmax(420px, 1fr) minmax(440px, .76fr); background: #101213; }
 .login-brand { position: relative; min-height: 100vh; padding: 42px 54px 58px; display: flex; flex-direction: column; justify-content: space-between; border-right: 1px solid var(--line); background-color: #121616; background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px); background-size: 32px 32px; }
@@ -273,7 +274,7 @@ th:last-child, td:last-child { width: 7%; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 
-/* ThinkTV monochrome admin theme */
+/* JJboneTv monochrome admin theme */
 :root {
   color-scheme: dark;
   background: #0b0d10;

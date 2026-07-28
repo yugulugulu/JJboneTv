@@ -29,7 +29,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ThinkAI Studio API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="JJboneTv API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(AuthRateLimitMiddleware)
 app.include_router(auth_router)
 app.include_router(project_domain_router)

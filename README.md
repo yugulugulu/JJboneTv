@@ -1,6 +1,6 @@
-# ThinkAI Studio
+# JJboneTv
 
-ThinkAI Studio 是一个面向文本、图片、视频和音频生成的画布工作台。当前版本包含用户私有的文件夹与项目库、完整画布持久化、历史版本、统一资产模型，以及可扩展的生成任务 API。
+JJboneTv 是一个面向文本、图片、视频和音频生成的画布工作台。当前版本包含用户私有的文件夹与项目库、完整画布持久化、历史版本、统一资产模型，以及可扩展的生成任务 API。
 
 ## 技术架构
 
@@ -30,6 +30,19 @@ docker compose --env-file .env.development ps
 curl http://localhost:3001/api/health
 curl http://localhost:3002/admin-api/health
 ```
+
+### 开发热更新
+
+如果只修改源码，不想每次重新构建镜像，使用开发覆盖配置启动：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+  --env-file .env.development up -d --build
+```
+
+这个命令首次仍需要构建后端依赖；之后修改 `backend/app` 会触发 Uvicorn 自动重载，修改 `frontend` 或 `admin-frontend` 会由 Vite HMR 自动更新。用户端和管理端入口仍分别是 `http://localhost:3001` 和 `http://localhost:3002`，`/api` 与 `/admin-api` 会通过 Vite 代理到对应后端。
+
+Worker 也会监听 Python 文件并自动重启。修改 `requirements.txt`、`package-lock.json`、Dockerfile、系统依赖或环境变量后，仍需重新构建或重启相关服务。`docker-compose.dev.yml` 仅用于开发，生产部署继续使用原来的 `docker-compose.yml`。
 
 `migration` 正常完成后状态会显示为 `Exited (0)`。生成任务由不开放端口的 `worker` 服务持久领取；可以使用以下命令查看迁移和 Worker 日志：
 
