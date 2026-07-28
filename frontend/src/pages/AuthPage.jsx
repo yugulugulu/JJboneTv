@@ -44,7 +44,7 @@ export function AuthPage({ mode }) {
           <AuthHeading mode={mode} />
           <AuthTabs mode={mode} onChange={changeMode} />
           <AuthForm mode={mode} onSubmit={submit} loggedOut={loggedOut} />
-          <p className="auth-legal">继续即代表你同意 ThinkAI 的服务条款与隐私政策。</p>
+          <p className="auth-legal">继续即代表你同意 JJboneTv 的服务条款与隐私政策。</p>
         </div>
       </section>
     </main>

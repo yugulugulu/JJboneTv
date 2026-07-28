@@ -91,7 +91,7 @@ export function ZeroKeyPromptDialog() {
         <span className="zero-key-eyebrow">开始创作前</span>
         <h2 id="zero-key-title">配置你的 API Key</h2>
         <p id="zero-key-description">
-          点击右上角“配置”，根据相应分组，填写你的 Thinkai API Key，即可开始使用生图功能！
+          点击右上角“配置”，根据相应分组，填写你的 JJboneTv API Key，即可开始使用生图功能！
         </p>
 
         <div className="zero-key-actions">

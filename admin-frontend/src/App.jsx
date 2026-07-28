@@ -181,10 +181,10 @@ function LoginScreen({ onAuthenticated }) {
 
   return (
     <main className="login-page">
-      <section className="login-brand" aria-label="ThinkTV 管理后台">
+      <section className="login-brand" aria-label="JJboneTv 管理后台">
         <div className="brand-lockup">
-          <span className="brand-mark"><ShieldCheck size={22} /></span>
-          <span><strong>ThinkTV</strong><small>ADMIN CONSOLE</small></span>
+          <span className="brand-mark"><img src="/assets/branding/jjbonetv-logo.png" alt="" /></span>
+          <span><strong>JJboneTv</strong><small>ADMIN CONSOLE</small></span>
         </div>
         <div className="login-context">
           <span className="eyebrow">内部管理系统</span>
@@ -988,7 +988,7 @@ function ModelGroupFormDrawer({ group, onClose, onSaved }) {
       <aside className="form-drawer compact-drawer" aria-label={editing ? '编辑模型分组' : '新建模型分组'}>
         <header className="drawer-header"><div><span className="drawer-kicker">Model group</span><h2>{editing ? '编辑模型分组' : '新建模型分组'}</h2></div><button className="icon-button" type="button" aria-label="关闭分组表单" disabled={submitting} onClick={onClose}><X size={18} /></button></header>
         <form className="model-form" onSubmit={submit}>
-          <label><span>分组名称 *</span><input value={values.name} onChange={(event) => update('name', event.target.value)} placeholder="例如：OpenAI、ThinkAI CH1" /></label>
+          <label><span>分组名称 *</span><input value={values.name} onChange={(event) => update('name', event.target.value)} placeholder="例如：OpenAI、JJboneTv CH1" /></label>
           <label><span>描述</span><textarea rows="4" value={values.description} onChange={(event) => update('description', event.target.value)} placeholder="说明该分组对应的服务商或 API Key 使用范围" /></label>
           <div className="form-grid two-columns">
             <label><span>状态</span><select value={values.status} onChange={(event) => update('status', event.target.value)} disabled={values.status === 'archived'}><option value="draft">草稿</option><option value="active">启用</option><option value="disabled">停用</option>{values.status === 'archived' && <option value="archived">不可用（历史状态）</option>}</select></label>
@@ -1226,7 +1226,7 @@ function AdminShell({ admin, onLogout, activeView }) {
   return (
     <div className="admin-shell">
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
-        <div className="sidebar-brand"><span className="brand-mark compact"><ShieldCheck size={18} /></span><span><strong>ThinkTV</strong><small>ADMIN</small></span></div>
+        <div className="sidebar-brand"><span className="brand-mark compact"><img src="/assets/branding/jjbonetv-logo.png" alt="" /></span><span><strong>JJboneTv</strong><small>ADMIN</small></span></div>
         <nav aria-label="管理后台导航">
           {NAV_ITEMS.map((item) => {
             const Icon = item.icon
@@ -1241,7 +1241,7 @@ function AdminShell({ admin, onLogout, activeView }) {
       </aside>
       {sidebarOpen && <button className="sidebar-scrim" type="button" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} />}
       <main className="admin-main">
-        <header className="mobile-header"><button className="icon-button" type="button" aria-label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><strong>ThinkTV Admin</strong></header>
+        <header className="mobile-header"><button className="icon-button" type="button" aria-label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><strong>JJboneTv Admin</strong></header>
         {activeView === 'users' && <UsersView notify={notify} />}
         {activeView === 'model-groups' && <ModelGroupsView notify={notify} />}
         {activeView === 'models' && <ModelsView notify={notify} />}
@@ -1264,7 +1264,7 @@ function AppRoutes() {
     return () => { active = false; window.removeEventListener('admin:unauthorized', unauthorized) }
   }, [])
 
-  if (session.checking) return <div className="app-loading"><span className="brand-mark"><ShieldCheck size={22} /></span><LoaderCircle className="spin" size={19} /><span>正在验证管理员会话</span></div>
+  if (session.checking) return <div className="app-loading"><span className="brand-mark"><img src="/assets/branding/jjbonetv-logo.png" alt="" /></span><LoaderCircle className="spin" size={19} /><span>正在验证管理员会话</span></div>
   if (!session.admin) return <Routes><Route path="/login" element={<LoginRoute onAuthenticated={(admin) => setSession({ checking: false, admin })} />} /><Route path="*" element={<Navigate to="/login" replace />} /></Routes>
   const logout = () => setSession({ checking: false, admin: null })
   return <Routes><Route path="/users" element={<AdminShell admin={session.admin} onLogout={logout} activeView="users" />} /><Route path="/model-groups" element={<AdminShell admin={session.admin} onLogout={logout} activeView="model-groups" />} /><Route path="/models" element={<AdminShell admin={session.admin} onLogout={logout} activeView="models" />} /><Route path="*" element={<Navigate to="/users" replace />} /></Routes>

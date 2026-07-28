@@ -1,7 +1,7 @@
 export function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
-      T<small>AI</small>
+      <img src="/assets/branding/jjbonetv-logo.png" alt="" />
     </span>
   )
 }

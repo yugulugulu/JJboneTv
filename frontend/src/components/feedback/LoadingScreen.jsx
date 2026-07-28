@@ -1,6 +1,6 @@
 import { BrandMark } from '../brand/BrandMark'
 
-export function LoadingScreen({ label = '正在进入 ThinkAI Studio', spinner = false }) {
+export function LoadingScreen({ label = '正在进入 JJboneTv', spinner = false }) {
   return (
     <main className="loading-screen" aria-live="polite">
       <BrandMark />

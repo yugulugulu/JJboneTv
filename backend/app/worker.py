@@ -55,7 +55,7 @@ def run(*, once: bool = False) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="ThinkTV generation worker")
+    parser = argparse.ArgumentParser(description="JJboneTv generation worker")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)

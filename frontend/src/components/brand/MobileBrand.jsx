@@ -4,7 +4,7 @@ export function MobileBrand() {
   return (
     <div className="mobile-brand">
       <BrandMark />
-      <span>ThinkAI Studio</span>
+      <span>JJboneTv</span>
     </div>
   )
 }
