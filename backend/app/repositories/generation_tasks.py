@@ -25,10 +25,17 @@ class GenerationTaskRepository:
         )
         for task in expired:
             if task.provider_request_started_at is not None:
-                task.status = "failed"
-                task.error = "Worker 租约过期，供应商结果未知，请重新发起"
-                task.result = {**(task.result or {}), "provider_outcome_unknown": True}
-                task.completed_at = now
+                if task.kind == "video" and task.provider_task_id:
+                    # The provider task is durable; resume polling after a worker
+                    # restart instead of submitting a duplicate request.
+                    task.status = "queued"
+                    task.next_attempt_at = now
+                    task.error = None
+                else:
+                    task.status = "failed"
+                    task.error = "Worker 租约过期，供应商结果未知，请重新发起"
+                    task.result = {**(task.result or {}), "provider_outcome_unknown": True}
+                    task.completed_at = now
             else:
                 task.status = "queued"
                 task.next_attempt_at = now
@@ -57,7 +64,8 @@ class GenerationTaskRepository:
         task.lease_token = uuid4()
         task.lease_owner = worker_id[:160]
         task.lease_expires_at = current + timedelta(seconds=settings.generation_lease_seconds)
-        task.provider_request_started_at = None
+        if not task.provider_task_id:
+            task.provider_request_started_at = None
         task.error = None
         return task
 
@@ -82,7 +90,8 @@ class GenerationTaskRepository:
         task.lease_token = uuid4()
         task.lease_owner = worker_id[:160]
         task.lease_expires_at = current + timedelta(seconds=settings.generation_lease_seconds)
-        task.provider_request_started_at = None
+        if not task.provider_task_id:
+            task.provider_request_started_at = None
         task.error = None
         return task
 

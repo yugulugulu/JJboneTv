@@ -579,6 +579,214 @@ function removeDerivedImageQualityFields(configSchema, defaultParameters, provid
   return { configSchema: nextSchema, defaultParameters: nextDefaults }
 }
 
+const EMPTY_VIDEO_OPTIONS = {
+  schema_version: 1,
+  resolution: { options: ['720p'], default: '720p' },
+  ratio: { options: ['16:9'], default: '16:9' },
+  referenceImages: ['0'],
+  referenceVideos: ['0'],
+  referenceAudios: ['0'],
+  referenceVideoMaxDurationSeconds: null,
+  referenceAudioMaxDurationSeconds: null,
+  promptMaxLength: null,
+  duration: { min: 1, max: 10, default: 5 },
+}
+
+function normalizeStringOptionList(value) {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.map((item) => String(item ?? '').trim()).filter(Boolean))]
+}
+
+function normalizeVideoOptions(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      ...EMPTY_VIDEO_OPTIONS,
+      resolution: { ...EMPTY_VIDEO_OPTIONS.resolution, options: [...EMPTY_VIDEO_OPTIONS.resolution.options] },
+      ratio: { ...EMPTY_VIDEO_OPTIONS.ratio, options: [...EMPTY_VIDEO_OPTIONS.ratio.options] },
+      referenceImages: [...EMPTY_VIDEO_OPTIONS.referenceImages],
+      referenceVideos: [...EMPTY_VIDEO_OPTIONS.referenceVideos],
+      referenceAudios: [...EMPTY_VIDEO_OPTIONS.referenceAudios],
+      duration: { ...EMPTY_VIDEO_OPTIONS.duration },
+    }
+  }
+  const resolutionOptions = normalizeStringOptionList(value.resolution?.options ?? EMPTY_VIDEO_OPTIONS.resolution.options)
+  const ratioOptions = normalizeStringOptionList(value.ratio?.options ?? EMPTY_VIDEO_OPTIONS.ratio.options)
+  const durationSource = value.duration && typeof value.duration === 'object' ? value.duration : {}
+  const normalizeCountOptions = (candidate) => candidate === undefined
+    ? []
+    : normalizeStringOptionList(Array.isArray(candidate) ? candidate : [candidate])
+  const toNumberOr = (candidate, fallback) => {
+    const number = Number(candidate)
+    return Number.isFinite(number) ? number : fallback
+  }
+  const normalizeLimit = (candidate) => {
+    if (candidate === null || candidate === '' || candidate === undefined) return null
+    const number = Number(candidate)
+    return Number.isFinite(number) && number >= 0 ? number : null
+  }
+  const min = toNumberOr(durationSource.min, EMPTY_VIDEO_OPTIONS.duration.min)
+  const max = toNumberOr(durationSource.max, EMPTY_VIDEO_OPTIONS.duration.max)
+  const normalizedMin = Math.max(0, min)
+  const normalizedMax = Math.max(normalizedMin, max)
+  const defaultDuration = toNumberOr(durationSource.default, EMPTY_VIDEO_OPTIONS.duration.default)
+  return {
+    schema_version: 1,
+    resolution: {
+      options: resolutionOptions,
+      default: String(value.resolution?.default || resolutionOptions[0] || ''),
+    },
+    ratio: {
+      options: ratioOptions,
+      default: String(value.ratio?.default || ratioOptions[0] || ''),
+    },
+    referenceImages: normalizeCountOptions(value.referenceImages),
+    referenceVideos: normalizeCountOptions(value.referenceVideos),
+    referenceAudios: normalizeCountOptions(value.referenceAudios),
+    referenceVideoMaxDurationSeconds: normalizeLimit(value.referenceVideoMaxDurationSeconds),
+    referenceAudioMaxDurationSeconds: normalizeLimit(value.referenceAudioMaxDurationSeconds),
+    promptMaxLength: normalizeLimit(value.promptMaxLength),
+    duration: {
+      min: normalizedMin,
+      max: normalizedMax,
+      default: Math.min(normalizedMax, Math.max(normalizedMin, defaultDuration)),
+    },
+  }
+}
+
+function withValidVideoDefaults(value) {
+  const normalized = normalizeVideoOptions(value)
+  const resolutionDefault = normalized.resolution.options.includes(normalized.resolution.default)
+    ? normalized.resolution.default
+    : normalized.resolution.options[0] || ''
+  const ratioDefault = normalized.ratio.options.includes(normalized.ratio.default)
+    ? normalized.ratio.default
+    : normalized.ratio.options[0] || ''
+  return {
+    ...normalized,
+    resolution: { ...normalized.resolution, default: resolutionDefault },
+    ratio: { ...normalized.ratio, default: ratioDefault },
+  }
+}
+
+let nextVideoOptionEditorId = 0
+
+function createVideoOptionEditorItem(value = '') {
+  nextVideoOptionEditorId += 1
+  return { id: `video-option-${nextVideoOptionEditorId}`, value: String(value ?? '') }
+}
+
+function createEditableVideoOptions(value) {
+  const normalized = normalizeVideoOptions(value)
+  const resolutionOptions = normalized.resolution.options.map(createVideoOptionEditorItem)
+  const ratioOptions = normalized.ratio.options.map(createVideoOptionEditorItem)
+  const singleCountOptions = (items) => {
+    const numbers = items.map((item) => Number(item)).filter(Number.isFinite)
+    return [createVideoOptionEditorItem(String(numbers.length ? Math.max(...numbers) : 0))]
+  }
+  return {
+    ...normalized,
+    resolution: {
+      options: resolutionOptions,
+      defaultOptionId: resolutionOptions.find((option) => option.value === normalized.resolution.default)?.id || resolutionOptions[0]?.id || '',
+    },
+    ratio: {
+      options: ratioOptions,
+      defaultOptionId: ratioOptions.find((option) => option.value === normalized.ratio.default)?.id || ratioOptions[0]?.id || '',
+    },
+    referenceImages: singleCountOptions(normalized.referenceImages),
+    referenceVideos: singleCountOptions(normalized.referenceVideos),
+    referenceAudios: singleCountOptions(normalized.referenceAudios),
+  }
+}
+
+function validateVideoOptions(value) {
+  if (!value.resolution.options.length) throw new Error('至少配置一个视频清晰度')
+  if (!value.ratio.options.length) throw new Error('至少配置一个视频比例')
+  const validateOptions = (options, label) => {
+    const keys = new Set()
+    for (const option of options) {
+      if (!option) throw new Error(`${label}不能包含空选项`)
+      if (keys.has(option.toLocaleLowerCase())) throw new Error(`${label}选项「${option}」重复（不区分大小写）`)
+      keys.add(option.toLocaleLowerCase())
+    }
+  }
+  validateOptions(value.resolution.options, '视频清晰度')
+  validateOptions(value.ratio.options, '视频比例')
+  validateOptions(value.referenceImages, '图片参考数量')
+  validateOptions(value.referenceVideos, '视频参考数量')
+  validateOptions(value.referenceAudios, '音频参考数量')
+  for (const [options, label] of [
+    [value.referenceImages, '图片参考数量'],
+    [value.referenceVideos, '视频参考数量'],
+    [value.referenceAudios, '音频参考数量'],
+  ]) {
+    for (const option of options) {
+      if (!/^\d+$/.test(option)) throw new Error(`${label}必须使用非负整数数量`)
+      if (Number(option) > 100) throw new Error(`${label}不能超过 100`)
+    }
+  }
+  if (value.resolution.options.length && !value.resolution.options.includes(value.resolution.default)) throw new Error('默认视频清晰度必须是当前选项')
+  if (value.ratio.options.length && !value.ratio.options.includes(value.ratio.default)) throw new Error('默认视频比例必须是当前选项')
+  if (value.referenceVideoMaxDurationSeconds !== null && (!Number.isInteger(value.referenceVideoMaxDurationSeconds) || value.referenceVideoMaxDurationSeconds > 86400)) throw new Error('视频参考总时长必须是 0–86400 秒整数')
+  if (value.referenceAudioMaxDurationSeconds !== null && (!Number.isInteger(value.referenceAudioMaxDurationSeconds) || value.referenceAudioMaxDurationSeconds > 86400)) throw new Error('音频参考总时长必须是 0–86400 秒整数')
+  if (value.promptMaxLength !== null && (!Number.isInteger(value.promptMaxLength) || value.promptMaxLength < 1 || value.promptMaxLength > 4000)) throw new Error('视频提示词字数上限必须是 1–4000 的整数')
+  if (!Number.isInteger(value.duration.min) || !Number.isInteger(value.duration.max) || !Number.isInteger(value.duration.default) || value.duration.min < 0 || value.duration.max > 86400 || value.duration.max < value.duration.min || value.duration.default < value.duration.min || value.duration.default > value.duration.max) {
+    throw new Error('视频时长必须满足 0 ≤ 最小值 ≤ 默认值 ≤ 最大值，且均为不超过 86400 的整数秒')
+  }
+}
+
+function removeDerivedVideoOptionFields(configSchema, defaultParameters) {
+  const nextSchema = { ...configSchema }
+  if (nextSchema.properties && typeof nextSchema.properties === 'object' && !Array.isArray(nextSchema.properties)) {
+    const properties = { ...nextSchema.properties }
+    ;['resolution', 'ratio', 'duration'].forEach((key) => delete properties[key])
+    nextSchema.properties = properties
+  }
+  const nextDefaults = { ...defaultParameters }
+  ;['resolution', 'ratio', 'duration'].forEach((key) => delete nextDefaults[key])
+  return { configSchema: nextSchema, defaultParameters: nextDefaults }
+}
+
+function StringOptionEditor({ label, options, onChange, placeholder, single = false }) {
+  if (single) {
+    const option = options[0] || createVideoOptionEditorItem('0')
+    return (
+      <div className="video-option-list">
+        <div className="video-option-list-heading">
+          <span>{label}</span>
+        </div>
+        <div className="video-option-row">
+          <input
+            type="number"
+            min="0"
+            max="100"
+            step="1"
+            value={option.value}
+            onChange={(event) => onChange([{ ...option, value: event.target.value }])}
+            placeholder={placeholder}
+          />
+          <span className="video-option-suffix">个</span>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="video-option-list">
+      <div className="video-option-list-heading">
+        <span>{label}</span>
+        <button className="text-button" type="button" onClick={() => onChange([...options, createVideoOptionEditorItem()])}><Plus size={14} />添加</button>
+      </div>
+      {!options.length && <div className="image-size-empty">尚未配置选项。</div>}
+      {options.map((option, index) => (
+        <div className="video-option-row" key={option.id}>
+          <input value={option.value} onChange={(event) => onChange(options.map((item) => item.id === option.id ? { ...item, value: event.target.value } : item))} placeholder={placeholder} />
+          <button className="icon-button danger-icon-button" type="button" aria-label={`删除${label}${index + 1}`} onClick={() => onChange(options.filter((item) => item.id !== option.id))}><X size={14} /></button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function ModelFormDrawer({ model, groups, onClose, onSaved }) {
   const editing = Boolean(model)
   const [values, setValues] = useState(() => ({ ...EMPTY_MODEL, ...model }))
@@ -593,6 +801,16 @@ function ModelFormDrawer({ model, groups, onClose, onSaved }) {
   const [imageSizeMatrixTouched, setImageSizeMatrixTouched] = useState(false)
   const [imageQualityOptions, setImageQualityOptions] = useState(() => normalizeImageQualityOptions(model?.metadata?.image_quality_options))
   const [imageQualityOptionsTouched, setImageQualityOptionsTouched] = useState(false)
+  const existingVideoOptions = model?.kind === 'video' && model?.metadata?.video_options && typeof model.metadata.video_options === 'object'
+    ? model.metadata.video_options
+    : null
+  const [videoOptions, setVideoOptions] = useState(() => createEditableVideoOptions(model?.kind === 'video' ? (existingVideoOptions || {}) : undefined))
+  const [videoOptionsTouched, setVideoOptionsTouched] = useState(false)
+  const [videoReferenceFieldsTouched, setVideoReferenceFieldsTouched] = useState(() => ({
+    referenceImages: false,
+    referenceVideos: false,
+    referenceAudios: false,
+  }))
   const [metadataExpanded, setMetadataExpanded] = useState(false)
   const activeGroups = groups.filter((group) => group.status === 'active')
   const currentGroup = groups.find((group) => String(group.id) === String(values.group_id))
@@ -653,6 +871,36 @@ function ModelFormDrawer({ model, groups, onClose, onSaved }) {
     return { ...current, options: [...current.options, { key: `quality_${suffix}`, display_name: `质量 ${suffix}`, provider_value: '' }] }
   })
   const removeQualityOption = (optionIndex) => updateImageQualityOptions((current) => ({ ...current, options: current.options.filter((_, index) => index !== optionIndex) }))
+  const updateVideoOptions = (updater) => {
+    setVideoOptions((current) => typeof updater === 'function' ? updater(current) : updater)
+    setVideoOptionsTouched(true)
+  }
+  const updateVideoOptionList = (field, options) => {
+    updateVideoOptions((current) => {
+      const nextOptions = [...options]
+      if (field === 'resolution' || field === 'ratio') {
+        const currentGroup = current[field]
+        const nextDefaultOptionId = nextOptions.some((option) => option.id === currentGroup.defaultOptionId)
+          ? currentGroup.defaultOptionId
+          : nextOptions.find((option) => option.value.trim())?.id || nextOptions[0]?.id || ''
+        return {
+          ...current,
+          [field]: {
+            ...currentGroup,
+            options: nextOptions,
+            defaultOptionId: nextDefaultOptionId,
+          },
+        }
+      }
+      if (['referenceImages', 'referenceVideos', 'referenceAudios'].includes(field)) {
+        return { ...current, [field]: nextOptions.slice(0, 1) }
+      }
+      return { ...current, [field]: nextOptions }
+    })
+    if (['referenceImages', 'referenceVideos', 'referenceAudios'].includes(field)) {
+      setVideoReferenceFieldsTouched((current) => ({ ...current, [field]: true }))
+    }
+  }
 
   const submit = async (event) => {
     event.preventDefault()
@@ -795,6 +1043,74 @@ function ModelFormDrawer({ model, groups, onClose, onSaved }) {
       configSchema = cleaned.configSchema
       defaultParameters = cleaned.defaultParameters
     }
+    if (values.kind === 'video') {
+      const selectedResolution = videoOptions.resolution.options.find((option) => option.id === videoOptions.resolution.defaultOptionId)
+      const selectedRatio = videoOptions.ratio.options.find((option) => option.id === videoOptions.ratio.defaultOptionId)
+      const normalizedVideo = withValidVideoDefaults({
+        ...videoOptions,
+        resolution: {
+          options: normalizeStringOptionList(videoOptions.resolution.options.map((option) => option.value)),
+          default: String(selectedResolution?.value || '').trim(),
+        },
+        ratio: {
+          options: normalizeStringOptionList(videoOptions.ratio.options.map((option) => option.value)),
+          default: String(selectedRatio?.value || '').trim(),
+        },
+        referenceImages: normalizeStringOptionList(videoOptions.referenceImages.map((option) => option.value)),
+        referenceVideos: normalizeStringOptionList(videoOptions.referenceVideos.map((option) => option.value)),
+        referenceAudios: normalizeStringOptionList(videoOptions.referenceAudios.map((option) => option.value)),
+        referenceVideoMaxDurationSeconds: videoOptions.referenceVideoMaxDurationSeconds === null || videoOptions.referenceVideoMaxDurationSeconds === ''
+          ? null
+          : Number(videoOptions.referenceVideoMaxDurationSeconds),
+        referenceAudioMaxDurationSeconds: videoOptions.referenceAudioMaxDurationSeconds === null || videoOptions.referenceAudioMaxDurationSeconds === ''
+          ? null
+          : Number(videoOptions.referenceAudioMaxDurationSeconds),
+        promptMaxLength: videoOptions.promptMaxLength === null || videoOptions.promptMaxLength === ''
+          ? null
+          : Number(videoOptions.promptMaxLength),
+        duration: {
+          min: Number(videoOptions.duration.min),
+          max: Number(videoOptions.duration.max),
+          default: Number(videoOptions.duration.default),
+        },
+      })
+      try {
+        validateVideoOptions(normalizedVideo)
+      } catch (videoError) {
+        setError(videoError.message)
+        return
+      }
+      if (model?.kind === 'video') {
+        for (const field of ['referenceImages', 'referenceVideos', 'referenceAudios']) {
+          const previouslyConfigured = existingVideoOptions?.[field] !== undefined
+          if (!previouslyConfigured && !videoReferenceFieldsTouched[field]) delete normalizedVideo[field]
+        }
+      }
+      const properties = configSchema.properties && typeof configSchema.properties === 'object' && !Array.isArray(configSchema.properties) ? configSchema.properties : {}
+      metadata = { ...metadata, video_options: normalizedVideo }
+      configSchema = {
+        ...configSchema,
+        type: configSchema.type || 'object',
+        properties: {
+          ...properties,
+          resolution: { ...(properties.resolution || {}), type: 'string', title: properties.resolution?.title || '视频清晰度', enum: normalizedVideo.resolution.options },
+          ratio: { ...(properties.ratio || {}), type: 'string', title: properties.ratio?.title || '视频比例', enum: normalizedVideo.ratio.options },
+          duration: { ...(properties.duration || {}), type: 'integer', title: properties.duration?.title || '视频时长', minimum: normalizedVideo.duration.min, maximum: normalizedVideo.duration.max },
+        },
+      }
+      defaultParameters = {
+        ...defaultParameters,
+        resolution: normalizedVideo.resolution.default,
+        ratio: normalizedVideo.ratio.default,
+        duration: normalizedVideo.duration.default,
+      }
+    } else if (videoOptionsTouched || (values.kind !== 'video' && Boolean(model?.metadata?.video_options))) {
+      metadata = { ...metadata }
+      delete metadata.video_options
+      const cleaned = removeDerivedVideoOptionFields(configSchema, defaultParameters)
+      configSchema = cleaned.configSchema
+      defaultParameters = cleaned.defaultParameters
+    }
     const payload = {
       group_id: values.group_id,
       model_name: values.model_name.trim(),
@@ -928,6 +1244,123 @@ function ModelFormDrawer({ model, groups, onClose, onSaved }) {
                 </div>
               )}
               <p className="image-size-note">保存时会写入 Metadata 的 <code>image_quality_options.provider_parameter</code>，并将质量值同步到配置 Schema 与默认参数中的对应请求字段。旧字段 <code>parameter_name</code> 可继续读取，但再次保存时会自动升级。</p>
+            </section>
+          )}
+          {values.kind === 'video' && (
+            <section className="image-size-editor video-options-editor" aria-labelledby="video-options-editor-title">
+              <div className="image-size-editor-heading">
+                <div>
+                  <span className="drawer-kicker">Video options</span>
+                  <h3 id="video-options-editor-title">视频生成选项</h3>
+                  <p>配置用户端可选的视频清晰度、比例、参考素材数量和时长范围；保存时会同步 Metadata、配置 Schema 与默认参数。</p>
+                </div>
+              </div>
+              <div className="form-grid two-columns">
+                <StringOptionEditor
+                  label="清晰度选项"
+                  options={videoOptions.resolution.options}
+                  onChange={(options) => updateVideoOptionList('resolution', options)}
+                  placeholder="例如 1080p"
+                />
+                <StringOptionEditor
+                  label="比例选项"
+                  options={videoOptions.ratio.options}
+                  onChange={(options) => updateVideoOptionList('ratio', options)}
+                  placeholder="例如 16:9"
+                />
+              </div>
+              <div className="form-grid two-columns matrix-defaults">
+                <label>
+                  <span>默认清晰度</span>
+                  <select
+                    value={videoOptions.resolution.defaultOptionId}
+                    onChange={(event) => updateVideoOptions((current) => ({ ...current, resolution: { ...current.resolution, defaultOptionId: event.target.value } }))}
+                    disabled={!videoOptions.resolution.options.length}
+                  >
+                    {!videoOptions.resolution.options.length && <option value="">暂无选项</option>}
+                    {videoOptions.resolution.options.map((option) => <option key={option.id} value={option.id}>{option.value || '未填写'}</option>)}
+                  </select>
+                </label>
+                <label>
+                  <span>默认比例</span>
+                  <select
+                    value={videoOptions.ratio.defaultOptionId}
+                    onChange={(event) => updateVideoOptions((current) => ({ ...current, ratio: { ...current.ratio, defaultOptionId: event.target.value } }))}
+                    disabled={!videoOptions.ratio.options.length}
+                  >
+                    {!videoOptions.ratio.options.length && <option value="">暂无选项</option>}
+                    {videoOptions.ratio.options.map((option) => <option key={option.id} value={option.id}>{option.value || '未填写'}</option>)}
+                  </select>
+                </label>
+              </div>
+              <div className="form-grid three-columns video-reference-options">
+                <StringOptionEditor
+                  label="图片参考最大数量"
+                  options={videoOptions.referenceImages}
+                  onChange={(options) => updateVideoOptionList('referenceImages', options)}
+                  placeholder="例如 4"
+                  single
+                />
+                <StringOptionEditor
+                  label="视频参考最大数量"
+                  options={videoOptions.referenceVideos}
+                  onChange={(options) => updateVideoOptionList('referenceVideos', options)}
+                  placeholder="例如 3"
+                  single
+                />
+                <StringOptionEditor
+                  label="音频参考最大数量"
+                  options={videoOptions.referenceAudios}
+                  onChange={(options) => updateVideoOptionList('referenceAudios', options)}
+                  placeholder="例如 3"
+                  single
+                />
+              </div>
+              <div className="form-grid three-columns video-limits">
+                <label>
+                  <span>视频参考总时长上限（秒）</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={videoOptions.referenceVideoMaxDurationSeconds ?? ''}
+                    onChange={(event) => updateVideoOptions((current) => ({ ...current, referenceVideoMaxDurationSeconds: event.target.value === '' ? null : event.target.value }))}
+                    placeholder="留空表示不限制"
+                  />
+                </label>
+                <label>
+                  <span>音频参考总时长上限（秒）</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={videoOptions.referenceAudioMaxDurationSeconds ?? ''}
+                    onChange={(event) => updateVideoOptions((current) => ({ ...current, referenceAudioMaxDurationSeconds: event.target.value === '' ? null : event.target.value }))}
+                    placeholder="留空表示不限制"
+                  />
+                </label>
+                <div className="video-duration-fields">
+                  <span>视频时长（秒）</span>
+                  <div className="form-grid three-columns compact-fields">
+                    <label><span>最小</span><input type="number" min="0" step="1" value={videoOptions.duration.min} onChange={(event) => updateVideoOptions((current) => ({ ...current, duration: { ...current.duration, min: event.target.value } }))} /></label>
+                    <label><span>最大</span><input type="number" min="0" step="1" value={videoOptions.duration.max} onChange={(event) => updateVideoOptions((current) => ({ ...current, duration: { ...current.duration, max: event.target.value } }))} /></label>
+                    <label><span>默认</span><input type="number" min="0" step="1" value={videoOptions.duration.default} onChange={(event) => updateVideoOptions((current) => ({ ...current, duration: { ...current.duration, default: event.target.value } }))} /></label>
+                  </div>
+                </div>
+              </div>
+              <label className="video-prompt-limit-field">
+                <span>提示词字数上限</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="4000"
+                  step="1"
+                  value={videoOptions.promptMaxLength ?? ''}
+                  onChange={(event) => updateVideoOptions((current) => ({ ...current, promptMaxLength: event.target.value === '' ? null : event.target.value }))}
+                  placeholder="留空表示不限制"
+                />
+                <small>按最终发送给视频模型的提示词计数，可填写 1–4000；留空时不限制。</small>
+              </label>
             </section>
           )}
           {values.kind !== 'text' && <><label><span>配置 Schema</span><textarea className="code-input" rows="7" spellCheck="false" value={jsonValues.config_schema} onChange={(event) => setJsonValues((current) => ({ ...current, config_schema: event.target.value }))} /></label>

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     admin_bootstrap_password: str = ""
     user_model_credentials_secret: str = "change-user-model-credentials-secret-in-production"
     app_environment: str = "development"
+    app_public_base_url: str = ""
     asset_storage_backend: str = "local"
     generated_storage_root: str = "/app/storage/generated"
     oss_endpoint: str = ""
@@ -30,10 +31,14 @@ class Settings(BaseSettings):
     provider_connect_timeout_seconds: float = 15
     provider_read_timeout_seconds: float = 300
     generated_asset_max_bytes: int = 30 * 1024 * 1024
+    generated_video_asset_max_bytes: int = 200 * 1024 * 1024
     user_image_upload_max_bytes: int = 20 * 1024 * 1024
+    user_video_upload_max_bytes: int = 200 * 1024 * 1024
+    user_audio_upload_max_bytes: int = 50 * 1024 * 1024
     generation_input_images_max_total_bytes: int = 100 * 1024 * 1024
     provider_response_max_bytes: int = 48 * 1024 * 1024
     provider_max_outputs: int = 4
+    provider_video_poll_seconds: float = 5.0
     auth_rate_limit_attempts: int = 5
     auth_rate_limit_window_seconds: int = 60
     auth_trusted_proxy_cidrs: str = ""

@@ -49,7 +49,37 @@ def test_workflow_accepts_legacy_handles_on_compatible_acyclic_edges():
     assert parsed.edges[0].target_handle == "top"
 
 
-@pytest.mark.parametrize("case", ["self", "duplicate", "incompatible", "cycle"])
+def test_workflow_accepts_media_metadata_and_generation_output_message():
+    node_id = uuid4()
+    asset_id = uuid4()
+    task_id = uuid4()
+    node = workflow_node(node_id, "video")
+    node["data"] = {
+        "asset_id": str(asset_id),
+        "asset_metadata": {
+            "byte_size": 1024,
+            "duration_ms": 5000,
+            "mime_type": "video/mp4",
+        },
+        "messages": [
+            {
+                "id": str(uuid4()),
+                "role": "assistant",
+                "content": "视频生成完成",
+                "generation_task_id": str(task_id),
+                "generation_phase": "completed",
+                "asset_id": str(asset_id),
+                "asset_kind": "video",
+                "created_at": "2026-08-05T00:00:00Z",
+            }
+        ],
+    }
+    parsed = validate([node], [])
+    assert parsed.nodes[0].data.asset_metadata["duration_ms"] == 5000
+    assert parsed.nodes[0].data.messages[0].asset_kind == "video"
+
+
+@pytest.mark.parametrize("case", ["self", "duplicate", "incompatible", "text_video", "cycle"])
 def test_workflow_rejects_invalid_graph_semantics(case):
     first = uuid4()
     second = uuid4()
@@ -62,6 +92,9 @@ def test_workflow_rejects_invalid_graph_semantics(case):
         edges = [workflow_edge(first, second), workflow_edge(first, second)]
     elif case == "incompatible":
         nodes = [workflow_node(first, "audio"), workflow_node(second, "image")]
+        edges = [workflow_edge(first, second)]
+    elif case == "text_video":
+        nodes = [workflow_node(first, "text"), workflow_node(second, "video")]
         edges = [workflow_edge(first, second)]
     else:
         nodes = [

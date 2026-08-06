@@ -1,17 +1,21 @@
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import socket
 import tempfile
+import time
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from uuid import UUID
 
 import httpx
+from sqlalchemy import select
 
 from ..config import settings
 from ..database import SessionLocal
@@ -20,11 +24,13 @@ from ..models import Asset, GenerationOutput, GenerationTask
 from ..repositories.generation_tasks import GenerationTaskRepository
 from .asset_storage import (
     AssetStorageError,
+    LocalAssetStorage,
     generation_asset_storage,
     storage_for_asset,
     storage_metadata,
 )
 from .model_catalog import ModelCatalogService, validate_http_api_key
+from .media_probe import MediaProbeError, inspect_media_file
 from .image_quality_options import resolve_image_quality_parameters
 from .image_size_matrix import (
     IMAGE_SIZE_UI_PARAMETERS,
@@ -41,6 +47,7 @@ from .generation_tasks import (
     mark_provider_started,
     retry_task,
 )
+from .video_model_options import validate_video_input_references, validate_video_prompt
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +58,48 @@ PROTOCOLS_REQUIRING_PROMPT = {"openai_images"}
 IMAGE_REFERENCE_TOKEN_RE = re.compile(
     r"@\{image:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\}"
 )
+MEDIA_REFERENCE_TOKEN_RE = re.compile(
+    r"@\{(image|video|audio):([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\}",
+    re.IGNORECASE,
+)
+REFERENCE_IMAGE_ORDINALS = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
+VIDEO_STATUS_ALIASES = {
+    "pending": "queued",
+    "created": "queued",
+    "waiting": "queued",
+    "processing": "running",
+    "in-progress": "running",
+    "in progress": "running",
+    "complete": "completed",
+    "success": "succeeded",
+    "done": "succeeded",
+    "canceled": "cancelled",
+}
+VIDEO_PLAIN_STATUS_VALUES = {
+    "queued",
+    "running",
+    "in_progress",
+    "completed",
+    "succeeded",
+    "failed",
+    "error",
+    "cancelled",
+    "canceled",
+    "pending",
+    "created",
+    "waiting",
+    "processing",
+    "success",
+    "done",
+}
+VIDEO_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$")
+VIDEO_DOWNLOAD_REDIRECT_CODES = {301, 302, 303, 307, 308}
+VIDEO_DOWNLOAD_MAX_REDIRECTS = 3
+VIDEO_DOWNLOAD_MAX_URL_LENGTH = 8192
+VIDEO_R2_DOWNLOAD_HOST_RE = re.compile(
+    r"^[0-9a-f]{32}\.r2\.cloudflarestorage\.com$"
+)
+VIDEO_PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 
 class ProviderGenerationError(Exception):
@@ -184,6 +233,10 @@ def validate_provider_input_support(provider: dict, input_references: list[dict]
             "unsupported-input: Selected model does not support predecessor input type: "
             + unsupported_by_model[0]
         )
+    if provider.get("kind") == "video":
+        # Video providers use the asynchronous /videos adapter below and may
+        # accept mixed reference media according to video_options.
+        return
     if media_kinds != {"image"}:
         raise DomainValidationError(
             "unsupported-input: Provider protocol does not support predecessor input type: "
@@ -275,9 +328,25 @@ def resolved_generation_prompt(client_prompt: str, input_references: list[dict])
 def effective_generation_prompt(
     kind: str, client_prompt: str, input_references: list[dict]
 ) -> str:
+    if kind == "video":
+        text_prompts = [
+            reference["prompt"]
+            for reference in input_references
+            if reference.get("kind") == "text" and isinstance(reference.get("prompt"), str)
+        ]
+        if text_prompts:
+            raise DomainValidationError(
+                "invalid-input: Video generation does not accept a text predecessor; enter the prompt in the video node"
+            )
+        source_prompt = client_prompt
+        compiled_prompt = compile_video_reference_tokens(source_prompt, input_references)
+        if not compiled_prompt.strip():
+            raise DomainValidationError(
+                "invalid-input: Video generation requires a non-empty prompt"
+            )
+        return compiled_prompt
     if kind != "image":
-        compatible_client_prompt = client_prompt if kind == "text" else ""
-        return resolved_generation_prompt(compatible_client_prompt, input_references)
+        return resolved_generation_prompt(client_prompt, input_references)
     text_prompts = [
         reference["prompt"]
         for reference in input_references
@@ -305,6 +374,44 @@ def compile_image_reference_tokens(prompt: str, input_references: list[dict]) ->
     return IMAGE_REFERENCE_TOKEN_RE.sub(
         lambda match: f"图片{node_positions[str(UUID(match.group(1)))] + 1}", prompt
     )
+
+
+def compile_video_reference_tokens(prompt: str, input_references: list[dict]) -> str:
+    node_positions: dict[tuple[str, str], int] = {}
+    counters: dict[str, int] = {"image": 0, "video": 0, "audio": 0}
+    for reference in input_references:
+        kind = str(reference.get("kind") or "").lower()
+        if kind not in counters:
+            continue
+        node_id = str(reference.get("node_id") or "")
+        node_positions[(kind, node_id)] = counters[kind]
+        counters[kind] += 1
+
+    matches = list(MEDIA_REFERENCE_TOKEN_RE.finditer(prompt))
+    token_prefixes = sum(prompt.lower().count(f"@{{{kind}:") for kind in counters)
+    if token_prefixes != len(matches):
+        raise DomainValidationError("invalid-input: Video media reference token is malformed")
+
+    def reference_label(kind: str, position: int) -> str:
+        ordinal = (
+            REFERENCE_IMAGE_ORDINALS[position]
+            if position < len(REFERENCE_IMAGE_ORDINALS)
+            else str(position + 1)
+        )
+        prefix = {"image": "参考图", "video": "参考视频", "audio": "参考音频"}[kind]
+        return f"@{prefix}{ordinal}"
+
+    def replace(match: re.Match[str]) -> str:
+        kind = match.group(1).lower()
+        node_id = str(UUID(match.group(2)))
+        position = node_positions.get((kind, node_id))
+        if position is None:
+            raise DomainValidationError(
+                f"invalid-input: Video {kind} reference token must reference a direct {kind} predecessor"
+            )
+        return reference_label(kind, position)
+
+    return MEDIA_REFERENCE_TOKEN_RE.sub(replace, prompt)
 
 
 def validate_required_provider_prompt(
@@ -357,6 +464,225 @@ def image_generation_endpoint(base_url: str, metadata: dict) -> str:
     if candidate.endswith("/images/generations"):
         return candidate
     return candidate + "/images/generations"
+
+
+def video_endpoint(base_url: str, metadata: dict, suffix: str = "") -> str:
+    candidate = _validated_provider_base_url(base_url)
+    configured = metadata.get("video_endpoint_path") or metadata.get("endpoint_path") or "/videos"
+    if not isinstance(configured, str) or not _valid_relative_endpoint_path(configured):
+        raise ProviderGenerationError("模型视频接口地址未正确配置")
+    path = "/" + configured.strip().lstrip("/")
+    path = path.rstrip("/")
+    if candidate.endswith(path):
+        endpoint = candidate
+    elif path == "/videos" and candidate.endswith("/videos"):
+        endpoint = candidate
+    else:
+        endpoint = candidate + path
+    return endpoint.rstrip("/") + suffix
+
+
+def _asset_reference_url(asset: Asset) -> str:
+    if not asset.storage_key:
+        raise ProviderGenerationError("视频参考素材缺少存储地址")
+    storage = storage_for_asset(asset.asset_metadata)
+    metadata = asset.asset_metadata if isinstance(asset.asset_metadata, dict) else {}
+    if isinstance(storage, LocalAssetStorage) or metadata.get("storage_backend") == "local":
+        base_url = settings.app_public_base_url.strip().rstrip("/")
+        if not base_url:
+            raise ProviderGenerationError("视频参考素材需要配置 OSS 或 APP_PUBLIC_BASE_URL")
+        return f"{base_url}/api/assets/{asset.id}/content"
+    try:
+        return storage.signed_get_url(asset.storage_key)
+    except Exception as error:
+        raise ProviderGenerationError("无法生成视频参考素材地址") from error
+
+
+def _video_status(payload: dict) -> str:
+    value = payload.get("status") or payload.get("state")
+    if value is None and isinstance(payload.get("data"), dict):
+        value = payload["data"].get("status") or payload["data"].get("state")
+    normalized = str(value).strip().lower() if value is not None else "unknown"
+    return VIDEO_STATUS_ALIASES.get(normalized, normalized)
+
+
+def _video_task_id(payload: dict) -> str | None:
+    for key in ("id", "task_id", "taskId"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return _video_task_id(data)
+    task = payload.get("task")
+    if isinstance(task, str) and task.strip():
+        return task.strip()
+    if isinstance(task, dict):
+        return _video_task_id(task)
+    return None
+
+
+def _video_task_id_from_location(location: str | None) -> str | None:
+    if not isinstance(location, str) or not location.strip():
+        return None
+    candidate = location.rstrip("/").rsplit("/", 1)[-1]
+    return candidate if VIDEO_TASK_ID_RE.fullmatch(candidate) else None
+
+
+def _provider_video_create_response(
+    client: httpx.Client, endpoint: str, **kwargs
+) -> dict:
+    """Accept JSON, a plain task ID, or a 202 Location response."""
+
+    with client.stream("POST", endpoint, **kwargs) as response:
+        body = _limited_response_bytes(
+            response, settings.provider_response_max_bytes, "供应商响应"
+        )
+        if not response.is_success:
+            raise ProviderHTTPError(
+                _provider_error(response.status_code, body),
+                retryable=response.status_code == 429 or response.status_code >= 500,
+            )
+        payload = _provider_json_payload(body)
+        if isinstance(payload, dict):
+            return payload
+        plain_id = _provider_body_text(body)
+        if VIDEO_TASK_ID_RE.fullmatch(plain_id):
+            return {"id": plain_id}
+        location_id = _video_task_id_from_location(response.headers.get("location"))
+        if location_id:
+            return {"id": location_id}
+        raise _provider_non_json_error("供应商返回的不是 JSON", response, body)
+
+
+def _provider_video_status_response(response: httpx.Response, body: bytes) -> dict:
+    payload = _provider_json_payload(body)
+    if isinstance(payload, dict):
+        return payload
+    plain_status = _provider_body_text(body).lower()
+    if plain_status in VIDEO_PLAIN_STATUS_VALUES:
+        return {"status": plain_status}
+    raise _provider_non_json_error("供应商视频状态响应不是 JSON", response, body)
+
+
+def _url_origin(url: str) -> tuple[str, str, int]:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        raise ProviderGenerationError("供应商返回了无效的视频下载地址")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ProviderGenerationError("供应商返回了无效的视频下载地址") from error
+    return (
+        parsed.scheme.lower(),
+        parsed.hostname.lower(),
+        port or (443 if parsed.scheme.lower() == "https" else 80),
+    )
+
+
+def _validate_video_redirect_url(url: str) -> str:
+    if not isinstance(url, str) or not url.strip() or len(url) > VIDEO_DOWNLOAD_MAX_URL_LENGTH:
+        raise ProviderGenerationError("供应商返回了无效的视频下载重定向")
+    candidate = url.strip()
+    parsed = urlparse(candidate)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ProviderGenerationError("供应商返回了不安全的视频下载重定向")
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError as error:
+        raise ProviderGenerationError("供应商返回了无效的视频下载重定向") from error
+
+    try:
+        hostname = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError as error:
+        raise ProviderGenerationError("供应商返回了无效的视频下载重定向") from error
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise ProviderGenerationError("供应商视频下载重定向指向受限地址")
+    try:
+        literal_addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except OSError as error:
+            raise ProviderGenerationError("供应商视频下载重定向地址无法解析") from error
+        literal_addresses = []
+        for item in resolved:
+            try:
+                address = ipaddress.ip_address(item[4][0].split("%", 1)[0])
+            except ValueError:
+                continue
+            if address not in literal_addresses:
+                literal_addresses.append(address)
+        if not literal_addresses:
+            raise ProviderGenerationError("供应商视频下载重定向地址无法解析")
+    restricted_addresses = [
+        address for address in literal_addresses if not address.is_global
+    ]
+    trusted_r2_fake_ip = (
+        parsed.scheme.lower() == "https"
+        and port == 443
+        and VIDEO_R2_DOWNLOAD_HOST_RE.fullmatch(hostname) is not None
+        and bool(restricted_addresses)
+        and all(
+            address.version == 4 and address in VIDEO_PROXY_FAKE_IP_NETWORK
+            for address in restricted_addresses
+        )
+    )
+    if restricted_addresses and not trusted_r2_fake_ip:
+        raise ProviderGenerationError("供应商视频下载重定向指向受限地址")
+    return candidate
+
+
+def _download_video_content(
+    client: httpx.Client,
+    content_url: str,
+    destination: Path,
+    headers: dict[str, str],
+) -> int:
+    """Download a provider video while following redirects without leaking credentials."""
+
+    original_origin = _url_origin(content_url)
+    current_url = content_url
+    request_headers = dict(headers)
+    redirects_followed = 0
+
+    while True:
+        with client.stream("GET", current_url, headers=request_headers) as response:
+            if response.status_code in VIDEO_DOWNLOAD_REDIRECT_CODES:
+                if redirects_followed >= VIDEO_DOWNLOAD_MAX_REDIRECTS:
+                    raise ProviderGenerationError("供应商视频下载重定向次数过多")
+                location = response.headers.get("location")
+                if not location:
+                    raise ProviderGenerationError("供应商视频下载重定向缺少 Location")
+                next_url = _validate_video_redirect_url(urljoin(current_url, location))
+                redirects_followed += 1
+                if _url_origin(next_url) != original_origin:
+                    request_headers.pop("Authorization", None)
+                current_url = next_url
+                continue
+
+            if not response.is_success:
+                body = _limited_response_bytes(
+                    response, settings.provider_response_max_bytes, "视频结果"
+                )
+                raise ProviderHTTPError(
+                    _provider_error(response.status_code, body),
+                    retryable=response.status_code >= 500 or response.status_code == 429,
+                )
+
+            total = 0
+            with destination.open("wb") as output:
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > settings.generated_video_asset_max_bytes:
+                        raise ProviderGenerationError("供应商返回的视频超过大小限制")
+                    output.write(chunk)
+            return total
 
 
 def image_edit_endpoint(base_url: str, metadata: dict) -> str:
@@ -444,6 +770,54 @@ def _download_image(client: httpx.Client, url: str) -> tuple[bytes, str | None]:
         return data, declared
 
 
+def _provider_body_text(body: bytes) -> str:
+    return body.decode("utf-8-sig", errors="replace").strip()
+
+
+def _provider_json_payload(body: bytes) -> object | None:
+    """Parse JSON and SSE-style `data: {...}` responses from async gateways."""
+
+    text = _provider_body_text(body)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, UnicodeDecodeError):
+        pass
+
+    candidates: list[object] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            continue
+        try:
+            candidates.append(json.loads(line))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return candidates[-1] if candidates else None
+
+
+def _provider_body_preview(body: bytes, limit: int = 400) -> str:
+    text = _provider_body_text(body)
+    if not text:
+        return "空响应"
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[已隐藏]", text)
+    text = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[^,\s}\"']+", r"\1[已隐藏]", text)
+    return text[:limit]
+
+
+def _provider_non_json_error(
+    label: str, response: httpx.Response, body: bytes
+) -> ProviderGenerationError:
+    content_type = response.headers.get("content-type", "未知")
+    return ProviderGenerationError(
+        f"{label}（HTTP {response.status_code}，Content-Type={content_type}）："
+        f"{_provider_body_preview(body)}"
+    )
+
+
 def _provider_json_response(client: httpx.Client, endpoint: str, **kwargs) -> dict:
     with client.stream("POST", endpoint, **kwargs) as response:
         body = _limited_response_bytes(
@@ -454,10 +828,9 @@ def _provider_json_response(client: httpx.Client, endpoint: str, **kwargs) -> di
                 _provider_error(response.status_code, body),
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
-    try:
-        payload = json.loads(body)
-    except (ValueError, UnicodeDecodeError) as error:
-        raise ProviderGenerationError("供应商返回的不是 JSON") from error
+    payload = _provider_json_payload(body)
+    if payload is None:
+        raise _provider_non_json_error("供应商返回的不是 JSON", response, body)
     if not isinstance(payload, dict):
         raise ProviderGenerationError("供应商响应格式无效")
     return payload
@@ -545,6 +918,229 @@ def _stage_edit_image(
     return destination_path, mime_type, f"input-{ordinal + 1}.{extension}", written
 
 
+def _persist_video_progress(task_id: UUID, lease_token: UUID, **values) -> bool:
+    with SessionLocal.begin() as db:
+        task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+        if task is None:
+            return False
+        for key, value in values.items():
+            setattr(task, key, value)
+        return True
+
+
+def _process_video_generation_task(task_id: UUID, lease_token: UUID) -> None:
+    """Submit and durably poll a provider's asynchronous /videos task."""
+    temp_dir = tempfile.TemporaryDirectory(prefix=f"thinktv-video-{task_id}-")
+    written_objects: list[tuple[object, str]] = []
+    try:
+        with SessionLocal.begin() as db:
+            task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+            if task is None:
+                return
+            owner_id, project_id = task.owner_id, task.project_id
+            model_id = UUID(task.model)
+            provider = ModelCatalogService(db).resolve_provider_configuration(owner_id, model_id)
+            provider["api_key"] = validate_http_api_key(provider["api_key"])
+            supplied_parameters, input_references = split_generation_parameters(task.parameters)
+            parameters = frozen_generation_parameters(supplied_parameters, provider)
+            effective_prompt = effective_generation_prompt("video", task.prompt, input_references)
+            validate_video_input_references(provider.get("metadata"), input_references)
+            validate_video_prompt(provider.get("metadata"), effective_prompt)
+            task.parameters = stored_generation_parameters(parameters, input_references)
+            task.prompt = effective_prompt
+            refs_by_kind: dict[str, list[str]] = {"image": [], "video": [], "audio": []}
+            for reference in input_references:
+                if reference.get("kind") in refs_by_kind:
+                    asset = db.get(Asset, UUID(str(reference.get("asset_id"))))
+                    if asset is None or asset.owner_id != owner_id or asset.project_id != project_id:
+                        raise ProviderGenerationError("视频参考素材不可用")
+                    refs_by_kind[reference["kind"]].append(_asset_reference_url(asset))
+            endpoint = video_endpoint(provider["base_url"], provider.get("metadata") or {})
+            headers = {
+                "Authorization": f"Bearer {provider['api_key']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "ThinkTV-video-worker/1.0",
+            }
+
+        timeout = httpx.Timeout(
+            settings.provider_read_timeout_seconds,
+            connect=settings.provider_connect_timeout_seconds,
+        )
+        with lease_heartbeat(task_id, lease_token) as lease_lost:
+            with provider_http_client(timeout) as client:
+                provider_task_id = None
+                with SessionLocal() as db:
+                    current = db.get(GenerationTask, task_id)
+                    provider_task_id = current.provider_task_id if current else None
+                if not provider_task_id:
+                    payload = _provider_video_create_response(
+                        client,
+                        endpoint,
+                        headers=headers,
+                        json={
+                            "model": provider["model_name"],
+                            "prompt": effective_prompt,
+                            **parameters,
+                            **(
+                                {"referenceImages": refs_by_kind["image"]}
+                                if refs_by_kind["image"]
+                                else {}
+                            ),
+                            **(
+                                {"referenceVideos": refs_by_kind["video"]}
+                                if refs_by_kind["video"]
+                                else {}
+                            ),
+                            **(
+                                {"referenceAudios": refs_by_kind["audio"]}
+                                if refs_by_kind["audio"]
+                                else {}
+                            ),
+                        },
+                    )
+                    provider_task_id = _video_task_id(payload)
+                    if not provider_task_id:
+                        raise ProviderGenerationError("供应商未返回视频任务 ID")
+                    if not _persist_video_progress(
+                        task_id,
+                        lease_token,
+                        provider_task_id=provider_task_id,
+                        result={"provider_status": _video_status(payload)},
+                        provider_request_started_at=datetime.now(timezone.utc),
+                    ):
+                        return
+
+                status_url = video_endpoint(
+                    provider["base_url"], provider.get("metadata") or {}, f"/{provider_task_id}"
+                )
+                content_url = video_endpoint(
+                    provider["base_url"],
+                    provider.get("metadata") or {},
+                    f"/{provider_task_id}/content",
+                )
+                last_status = None
+                while True:
+                    if lease_lost.is_set():
+                        return
+                    with client.stream(
+                        "GET",
+                        status_url,
+                        headers={
+                            "Authorization": f"Bearer {provider['api_key']}",
+                            "Accept": "application/json",
+                            "User-Agent": "ThinkTV-video-worker/1.0",
+                        },
+                    ) as response:
+                        body = _limited_response_bytes(response, settings.provider_response_max_bytes, "视频任务状态")
+                        if not response.is_success:
+                            raise ProviderHTTPError(
+                                _provider_error(response.status_code, body),
+                                retryable=response.status_code >= 500 or response.status_code == 429,
+                            )
+                    status_payload = _provider_video_status_response(response, body)
+                    status_value = _video_status(status_payload)
+                    if status_value != last_status:
+                        last_status = status_value
+                        _persist_video_progress(
+                            task_id,
+                            lease_token,
+                            result={
+                                **status_payload,
+                                "provider_status": status_value,
+                            },
+                        )
+                    if status_value in {"failed", "error", "cancelled", "canceled"}:
+                        raise ProviderGenerationError(
+                            str(
+                                status_payload.get("error")
+                                or status_payload.get("message")
+                                or "视频生成失败"
+                            )
+                        )
+                    if status_value in {"completed", "succeeded", "success", "done"}:
+                        break
+                    time.sleep(max(1.0, settings.provider_video_poll_seconds))
+
+                destination = Path(temp_dir.name) / "output.mp4"
+                total = _download_video_content(
+                    client,
+                    content_url,
+                    destination,
+                    {
+                        "Authorization": f"Bearer {provider['api_key']}",
+                        "Accept": "video/mp4,application/octet-stream,application/json",
+                        "User-Agent": "ThinkTV-video-worker/1.0",
+                    },
+                )
+                if total == 0:
+                    raise ProviderGenerationError("供应商返回了空视频")
+                try:
+                    inspected_video = inspect_media_file(destination, "video")
+                except MediaProbeError as error:
+                    raise ProviderGenerationError("供应商返回的视频文件无效") from error
+                storage = generation_asset_storage()
+                storage_key = storage.object_key(
+                    f"{owner_id}/{project_id}/{task_id}-{provider_task_id}.mp4"
+                )
+                storage.put_file(storage_key, destination, "video/mp4")
+                written_objects.append((storage, storage_key))
+                with SessionLocal.begin() as db:
+                    task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+                    if task is None:
+                        _cleanup_written_objects(written_objects)
+                        return
+                    asset = Asset(
+                        owner_id=owner_id,
+                        project_id=project_id,
+                        kind="video",
+                        source="generation",
+                        original_name=f"{provider['model_name']}.mp4",
+                        storage_key=storage_key,
+                        mime_type="video/mp4",
+                        byte_size=total,
+                        width=inspected_video.width,
+                        height=inspected_video.height,
+                        duration_ms=inspected_video.duration_ms,
+                        status="ready",
+                        asset_metadata={
+                            **storage_metadata(storage),
+                            "model_id": str(provider["model_id"]),
+                            "model_name": provider["model_name"],
+                            "provider_task_id": provider_task_id,
+                        },
+                    )
+                    db.add(asset)
+                    db.flush()
+                    db.add(GenerationOutput(generation_task_id=task.id, asset_id=asset.id, ordinal=0))
+                    task.status = "succeeded"
+                    task.result = {
+                        **(task.result or {}),
+                        "provider_status": "completed",
+                        "output_count": 1,
+                    }
+                    task.completed_at = datetime.now(timezone.utc)
+                    task.lease_token = task.lease_owner = task.lease_expires_at = None
+    except ProviderHTTPError as error:
+        _cleanup_written_objects(written_objects)
+        if error.retryable:
+            retry_task(task_id, lease_token, str(error))
+        else:
+            fail_task(task_id, lease_token, str(error))
+    except (ProviderGenerationError, DomainValidationError) as error:
+        _cleanup_written_objects(written_objects)
+        fail_task(task_id, lease_token, str(error))
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+        _cleanup_written_objects(written_objects)
+        retry_task(task_id, lease_token, f"连接视频模型供应商失败: {error}")
+    except Exception:
+        _cleanup_written_objects(written_objects)
+        logger.exception("Video generation task %s failed", task_id)
+        fail_task(task_id, lease_token, "视频生成服务发生内部错误")
+    finally:
+        temp_dir.cleanup()
+
+
 def process_claimed_generation_task(task_id: UUID, lease_token: UUID) -> None:
     written_objects: list[tuple[object, str]] = []
     input_temp_dir = tempfile.TemporaryDirectory(prefix=f"thinktv-input-{task_id}-")
@@ -552,6 +1148,11 @@ def process_claimed_generation_task(task_id: UUID, lease_token: UUID) -> None:
     provider_started = False
     provider_responded = False
     try:
+        with SessionLocal.begin() as db:
+            task_kind = db.scalar(select(GenerationTask.kind).where(GenerationTask.id == task_id))
+        if task_kind == "video":
+            _process_video_generation_task(task_id, lease_token)
+            return
         with SessionLocal.begin() as db:
             task = GenerationTaskRepository(db).leased_task(task_id, lease_token)
             if task is None:

@@ -176,7 +176,6 @@ def test_media_generation_uses_workflow_text_and_requires_predecessor(monkeypatc
 
         for kind, node_id in (
             ("image", empty_image_id),
-            ("video", empty_video_id),
             ("audio", empty_audio_id),
         ):
             no_predecessor = client.post(

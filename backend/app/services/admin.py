@@ -35,6 +35,11 @@ from .image_quality_options import (
     normalize_image_quality_metadata,
 )
 from .image_size_matrix import IMAGE_SIZE_MATRIX_KEY, normalize_model_metadata
+from .video_model_options import (
+    VIDEO_OPTIONS_KEY,
+    extract_normalized_provider_config,
+    normalize_video_options,
+)
 
 
 MODEL_FIELDS = (
@@ -224,7 +229,19 @@ class AdminService:
             metadata=metadata,
             explicitly_submitted=IMAGE_QUALITY_OPTIONS_KEY in payload.metadata,
         )
+        metadata = normalize_video_options(
+            kind=payload.kind,
+            config_schema=payload.config_schema,
+            default_parameters=payload.default_parameters,
+            metadata=metadata,
+            explicitly_submitted=VIDEO_OPTIONS_KEY in payload.metadata,
+        )
+        metadata, config_schema, default_parameters = extract_normalized_provider_config(
+            metadata, payload.config_schema, payload.default_parameters
+        )
         values = payload.model_dump(exclude={"metadata"})
+        values["config_schema"] = config_schema
+        values["default_parameters"] = default_parameters
         model = AIModel(
             id=uuid.uuid4(),
             key=str(uuid.uuid4()),
@@ -351,10 +368,28 @@ class AdminService:
                 and IMAGE_QUALITY_OPTIONS_KEY in payload.metadata
             ),
         )
+        normalized_metadata = normalize_video_options(
+            kind=effective_kind,
+            config_schema=effective_config_schema,
+            default_parameters=effective_default_parameters,
+            metadata=normalized_metadata,
+            explicitly_submitted=(
+                "metadata" in payload.model_fields_set
+                and isinstance(payload.metadata, dict)
+                and VIDEO_OPTIONS_KEY in payload.metadata
+            ),
+        )
+        normalized_metadata, effective_config_schema, effective_default_parameters = extract_normalized_provider_config(
+            normalized_metadata,
+            effective_config_schema,
+            effective_default_parameters,
+        )
         for field in payload.model_fields_set:
             value = getattr(payload, field)
             setattr(model, "model_metadata" if field == "metadata" else field, value)
         model.model_metadata = normalized_metadata
+        model.config_schema = effective_config_schema
+        model.default_parameters = effective_default_parameters
         credential = self._get_model_credential(model.id)
         after = self._model_snapshot(model)
         self.repo.add_audit(

@@ -6,7 +6,7 @@ import { createUuid } from '../utils/uuid'
 
 const THEME_STORAGE_KEY = 'thinkai-theme-mode'
 const THEME_SYNC_CHANNEL = 'thinkai-theme-sync-v1'
-const STUDIO_FRAME_VERSION = 'quality-image-editor-v1'
+const STUDIO_FRAME_VERSION = 'video-prompt-expand-v4'
 const THEME_MODES = new Set(['dark', 'light', 'system'])
 const RESOLVED_THEMES = new Set(['dark', 'light'])
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i

@@ -107,6 +107,34 @@ def _validate_provider_limits(errors: list[str], config: Settings) -> None:
     )
     _validate_range(
         errors,
+        "USER_VIDEO_UPLOAD_MAX_BYTES",
+        config.user_video_upload_max_bytes,
+        1024,
+        1024 * 1024 * 1024,
+    )
+    _validate_range(
+        errors,
+        "USER_AUDIO_UPLOAD_MAX_BYTES",
+        config.user_audio_upload_max_bytes,
+        1024,
+        512 * 1024 * 1024,
+    )
+    _validate_range(
+        errors,
+        "GENERATED_VIDEO_ASSET_MAX_BYTES",
+        config.generated_video_asset_max_bytes,
+        1024,
+        1024 * 1024 * 1024,
+    )
+    _validate_range(
+        errors,
+        "PROVIDER_VIDEO_POLL_SECONDS",
+        config.provider_video_poll_seconds,
+        1,
+        300,
+    )
+    _validate_range(
+        errors,
         "GENERATION_INPUT_IMAGES_MAX_TOTAL_BYTES",
         config.generation_input_images_max_total_bytes,
         1024,

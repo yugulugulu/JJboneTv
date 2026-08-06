@@ -89,6 +89,9 @@ class NodeMessage(BaseModel):
     content: str
     model_id: str | None = None
     generation_task_id: UUID | None = None
+    generation_phase: str | None = None
+    asset_id: UUID | None = None
+    asset_kind: Literal["text", "image", "video", "audio"] | None = None
     created_at: datetime
     model_config = ConfigDict(extra="forbid")
 
@@ -100,6 +103,7 @@ class NodeData(BaseModel):
     model_id: str | None = None
     parameters: dict = Field(default_factory=dict)
     asset_id: UUID | None = None
+    asset_metadata: dict = Field(default_factory=dict)
     generation_task_id: UUID | None = None
     messages: list[NodeMessage] = Field(default_factory=list)
     model_config = ConfigDict(extra="forbid")
@@ -127,7 +131,7 @@ class WorkflowEdge(BaseModel):
 WORKFLOW_INPUT_KINDS = {
     "text": set(),
     "image": {"text", "image"},
-    "video": {"text", "image", "video", "audio"},
+    "video": {"image", "video", "audio"},
     "audio": {"text"},
 }
 
