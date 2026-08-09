@@ -56,7 +56,7 @@ MODEL_FIELDS = (
     "metadata",
 )
 
-MODEL_GROUP_FIELDS = ("name", "description", "status", "display_order")
+MODEL_GROUP_FIELDS = ("name", "description", "runtime_limits", "status", "display_order")
 
 
 def validate_bootstrap_password(password: str) -> None:

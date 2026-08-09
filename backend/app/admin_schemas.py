@@ -55,9 +55,36 @@ ModelStatus = Literal["draft", "active", "disabled", "archived"]
 WritableModelStatus = Literal["draft", "active", "disabled"]
 
 
+def _validated_runtime_limits(value: dict) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("runtime_limits must be an object")
+    allowed = {"max_active", "max_submit_per_second"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"Unsupported runtime limit: {unknown[0]}")
+    normalized = dict(value)
+    for key in allowed:
+        if key not in normalized:
+            continue
+        limit = normalized[key]
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    return normalized
+
+
+def _validated_model_metadata(value: dict) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("metadata must be an object")
+    normalized = dict(value)
+    if "runtime_limits" in normalized:
+        normalized["runtime_limits"] = _validated_runtime_limits(normalized["runtime_limits"])
+    return normalized
+
+
 class AdminModelGroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     description: str = Field(default="", max_length=10000)
+    runtime_limits: dict = Field(default_factory=dict)
     status: WritableModelStatus = "draft"
     display_order: int = Field(default=0, ge=0)
     model_config = ConfigDict(extra="forbid")
@@ -67,10 +94,16 @@ class AdminModelGroupCreate(BaseModel):
     def trim_strings(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator("runtime_limits")
+    @classmethod
+    def validate_runtime_limits(cls, value: dict) -> dict:
+        return _validated_runtime_limits(value)
+
 
 class AdminModelGroupUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     description: str | None = Field(default=None, max_length=10000)
+    runtime_limits: dict | None = None
     status: WritableModelStatus | None = None
     display_order: int | None = Field(default=None, ge=0)
     model_config = ConfigDict(extra="forbid")
@@ -79,6 +112,11 @@ class AdminModelGroupUpdate(BaseModel):
     @classmethod
     def trim_optional_strings(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+    @field_validator("runtime_limits")
+    @classmethod
+    def validate_optional_runtime_limits(cls, value: dict | None) -> dict | None:
+        return _validated_runtime_limits(value) if value is not None else None
 
     @model_validator(mode="after")
     def require_changes(self):
@@ -91,6 +129,7 @@ class AdminModelGroupRead(BaseModel):
     id: UUID
     name: str
     description: str
+    runtime_limits: dict
     status: ModelStatus
     display_order: int
     created_by_admin_id: UUID | None
@@ -123,6 +162,11 @@ class AdminModelCreate(BaseModel):
     def trim_strings(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: dict) -> dict:
+        return _validated_model_metadata(value)
+
 
 class AdminModelUpdate(BaseModel):
     group_id: UUID | None = None
@@ -142,6 +186,11 @@ class AdminModelUpdate(BaseModel):
     @classmethod
     def trim_optional_strings(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_optional_metadata(cls, value: dict | None) -> dict | None:
+        return _validated_model_metadata(value) if value is not None else None
 
     @model_validator(mode="after")
     def require_changes(self):

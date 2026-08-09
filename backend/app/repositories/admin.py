@@ -232,6 +232,7 @@ class AdminRepository:
                 "id": group.id,
                 "name": group.name,
                 "description": group.description,
+                "runtime_limits": group.runtime_limits,
                 "status": group.status,
                 "display_order": group.display_order,
                 "created_by_admin_id": group.created_by_admin_id,

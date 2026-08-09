@@ -1424,7 +1424,7 @@ class ProjectDomainService:
             parameters=stored_generation_parameters(parameters, input_references),
             idempotency_key=idempotency_key,
             request_hash=request_hash,
-            max_attempts=settings.generation_max_attempts,
+            max_attempts=settings.provider_retry_max_attempts,
             result={},
         )
         self.db.add(task)
@@ -1570,7 +1570,7 @@ class ProjectDomainService:
             parameters=stored_generation_parameters(parameters, input_references),
             idempotency_key=idempotency_key,
             request_hash=request_hash,
-            max_attempts=settings.generation_max_attempts,
+            max_attempts=settings.provider_retry_max_attempts,
             result={},
         )
         try:

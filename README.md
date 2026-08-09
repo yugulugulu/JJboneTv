@@ -44,10 +44,10 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml \
 
 Worker 也会监听 Python 文件并自动重启。修改 `requirements.txt`、`package-lock.json`、Dockerfile、系统依赖或环境变量后，仍需重新构建或重启相关服务。`docker-compose.dev.yml` 仅用于开发，生产部署继续使用原来的 `docker-compose.yml`。
 
-`migration` 正常完成后状态会显示为 `Exited (0)`。生成任务由不开放端口的 `worker` 服务持久领取；可以使用以下命令查看迁移和 Worker 日志：
+`migration` 正常完成后状态会显示为 `Exited (0)`。图片和视频任务分别由不开放端口的 `image-worker`、`video-worker` 持久领取；可以使用以下命令查看迁移和 Worker 日志：
 
 ```bash
-docker compose --env-file .env.development logs migration worker
+docker compose --env-file .env.development logs migration image-worker video-worker
 ```
 
 停止服务：

@@ -1,5 +1,7 @@
 x-database-environment: &database-environment
   DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+  DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
+  DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-2}
   APP_ENVIRONMENT: ${APP_ENVIRONMENT:?APP_ENVIRONMENT is required}
 
 x-storage-environment: &storage-environment
@@ -27,6 +29,29 @@ x-provider-limits-environment: &provider-limits-environment
   PROVIDER_RESPONSE_MAX_BYTES: ${PROVIDER_RESPONSE_MAX_BYTES:-50331648}
   PROVIDER_MAX_OUTPUTS: ${PROVIDER_MAX_OUTPUTS:-4}
   PROVIDER_VIDEO_POLL_SECONDS: ${PROVIDER_VIDEO_POLL_SECONDS:-5}
+
+x-worker-environment: &worker-environment
+  APP_PUBLIC_BASE_URL: ${APP_PUBLIC_BASE_URL:-}
+  USER_MODEL_CREDENTIALS_SECRET: ${USER_MODEL_CREDENTIALS_SECRET:?USER_MODEL_CREDENTIALS_SECRET is required}
+  GENERATION_WORKER_POLL_SECONDS: ${GENERATION_WORKER_POLL_SECONDS:-1}
+  GENERATION_LEASE_SECONDS: ${GENERATION_LEASE_SECONDS:-90}
+  GENERATION_HEARTBEAT_SECONDS: ${GENERATION_HEARTBEAT_SECONDS:-30}
+  GENERATION_MAX_ATTEMPTS: ${GENERATION_MAX_ATTEMPTS:-3}
+  IMAGE_ACTIVE_WINDOW: ${IMAGE_ACTIVE_WINDOW:-20}
+  IMAGE_PROVIDER_CONCURRENCY: ${IMAGE_PROVIDER_CONCURRENCY:-10}
+  IMAGE_RESULT_CONCURRENCY: ${IMAGE_RESULT_CONCURRENCY:-3}
+  USER_IMAGE_ACTIVE_LIMIT: ${USER_IMAGE_ACTIVE_LIMIT:-4}
+  VIDEO_ACTIVE_LIMIT: ${VIDEO_ACTIVE_LIMIT:-10}
+  VIDEO_SUBMIT_CONCURRENCY: ${VIDEO_SUBMIT_CONCURRENCY:-4}
+  VIDEO_POLL_CONCURRENCY: ${VIDEO_POLL_CONCURRENCY:-4}
+  USER_VIDEO_ACTIVE_LIMIT: ${USER_VIDEO_ACTIVE_LIMIT:-2}
+  VIDEO_PROVIDER_TIMEOUT_SECONDS: ${VIDEO_PROVIDER_TIMEOUT_SECONDS:-3600}
+  VIDEO_POLL_CONNECT_TIMEOUT_SECONDS: ${VIDEO_POLL_CONNECT_TIMEOUT_SECONDS:-3}
+  VIDEO_POLL_READ_TIMEOUT_SECONDS: ${VIDEO_POLL_READ_TIMEOUT_SECONDS:-10}
+  PROVIDER_RETRY_MAX_ATTEMPTS: ${PROVIDER_RETRY_MAX_ATTEMPTS:-3}
+  PROVIDER_RETRY_MAX_DELAY_SECONDS: ${PROVIDER_RETRY_MAX_DELAY_SECONDS:-60}
+  TRASH_RETENTION_DAYS: ${TRASH_RETENTION_DAYS:-30}
+  TRASH_PURGE_INTERVAL_SECONDS: ${TRASH_PURGE_INTERVAL_SECONDS:-300}
 
 services:
   postgres:
@@ -87,20 +112,25 @@ services:
       retries: 10
     restart: unless-stopped
 
-  worker:
+  image-worker:
     build:
       context: ./backend
-    command: ["sh", "-c", "python -m app.runtime validate worker && exec python -m app.worker"]
+    command: ["sh", "-c", "python -m app.runtime validate worker && exec python -m app.worker --role image"]
     environment:
-      <<: [*database-environment, *storage-environment, *provider-limits-environment]
-      APP_PUBLIC_BASE_URL: ${APP_PUBLIC_BASE_URL:-}
-      USER_MODEL_CREDENTIALS_SECRET: ${USER_MODEL_CREDENTIALS_SECRET:?USER_MODEL_CREDENTIALS_SECRET is required}
-      GENERATION_WORKER_POLL_SECONDS: ${GENERATION_WORKER_POLL_SECONDS:-1}
-      GENERATION_LEASE_SECONDS: ${GENERATION_LEASE_SECONDS:-90}
-      GENERATION_HEARTBEAT_SECONDS: ${GENERATION_HEARTBEAT_SECONDS:-30}
-      GENERATION_MAX_ATTEMPTS: ${GENERATION_MAX_ATTEMPTS:-3}
-      TRASH_RETENTION_DAYS: ${TRASH_RETENTION_DAYS:-30}
-      TRASH_PURGE_INTERVAL_SECONDS: ${TRASH_PURGE_INTERVAL_SECONDS:-300}
+      <<: [*database-environment, *storage-environment, *provider-limits-environment, *worker-environment]
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    volumes:
+      - generated_assets:/app/storage/generated
+    restart: unless-stopped
+
+  video-worker:
+    build:
+      context: ./backend
+    command: ["sh", "-c", "python -m app.runtime validate worker && exec python -m app.worker --role video"]
+    environment:
+      <<: [*database-environment, *storage-environment, *provider-limits-environment, *worker-environment]
     depends_on:
       migration:
         condition: service_completed_successfully

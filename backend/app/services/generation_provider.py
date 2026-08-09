@@ -4,12 +4,13 @@ import hashlib
 import ipaddress
 import json
 import logging
+import random
 import re
 import socket
 import tempfile
 import time
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from uuid import UUID
@@ -945,6 +946,728 @@ def _persist_video_progress(task_id: UUID, lease_token: UUID, **values) -> bool:
         for key, value in values.items():
             setattr(task, key, value)
         return True
+
+
+def _release_task_lease(task: GenerationTask) -> None:
+    task.lease_token = None
+    task.lease_owner = None
+    task.lease_expires_at = None
+
+
+def _image_spool_dir() -> Path:
+    path = Path(settings.generated_storage_root) / ".worker-spool" / "images"
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
+
+
+def _validated_spool_path(value: str | None) -> Path:
+    if not value:
+        raise ProviderGenerationError("图片任务缺少临时供应商响应")
+    root = _image_spool_dir()
+    path = Path(value).resolve()
+    if path.parent != root or path.suffix != ".json":
+        raise ProviderGenerationError("图片任务临时响应路径无效")
+    return path
+
+
+def _stream_provider_response_to_file(
+    client: httpx.Client, endpoint: str, destination: Path, **kwargs
+) -> None:
+    partial = destination.with_suffix(".part")
+    partial.unlink(missing_ok=True)
+    try:
+        with client.stream("POST", endpoint, **kwargs) as response:
+            content_length = response.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > settings.provider_response_max_bytes:
+                        raise ProviderGenerationError("供应商响应超过大小限制")
+                except ValueError:
+                    pass
+            total = 0
+            with partial.open("wb") as output:
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > settings.provider_response_max_bytes:
+                        raise ProviderGenerationError("供应商响应超过大小限制")
+                    output.write(chunk)
+            if not response.is_success:
+                body = partial.read_bytes()
+                raise ProviderHTTPError(
+                    _provider_error(response.status_code, body),
+                    retryable=response.status_code in {429, 502, 503, 504},
+                )
+        partial.replace(destination)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def _retry_image_result(task_id: UUID, lease_token: UUID, message: str) -> bool:
+    with SessionLocal.begin() as db:
+        task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+        if task is None:
+            return False
+        now = datetime.now(timezone.utc)
+        task.poll_error_count += 1
+        task.last_provider_error = message.strip()[:2000]
+        task.error = message.strip()[:2000]
+        if task.poll_error_count >= settings.provider_retry_max_attempts:
+            task.status = "failed"
+            task.execution_phase = "failed"
+            task.completed_at = now
+            task.temporary_result_path = None
+            _release_task_lease(task)
+            return True
+        delay = min(
+            settings.provider_retry_max_delay_seconds,
+            max(1, 2**task.poll_error_count),
+        ) + random.uniform(0, 2)
+        task.next_attempt_at = now + timedelta(seconds=delay)
+        _release_task_lease(task)
+        return False
+
+
+def process_image_provider_request(task_id: UUID, lease_token: UUID) -> None:
+    """Call the image provider and hand its bounded response to the result pool."""
+    input_temp_dir = tempfile.TemporaryDirectory(prefix=f"jjbonetv-image-input-{task_id}-")
+    spool_path = _image_spool_dir() / f"{task_id}-{lease_token}.json"
+    provider_started = False
+    try:
+        with SessionLocal.begin() as db:
+            task = GenerationTaskRepository(db).leased_task(task_id, lease_token)
+            if task is None or task.kind != "image":
+                return
+            owner_id = task.owner_id
+            project_id = task.project_id
+            try:
+                provider = ModelCatalogService(db).resolve_provider_configuration(
+                    owner_id, UUID(task.model)
+                )
+            except (ValueError, ResourceNotFoundError) as error:
+                raise ProviderGenerationError("模型已停用或 API Key 已删除") from error
+            if (provider.get("metadata") or {}).get("protocol") != "openai_images":
+                raise ProviderGenerationError("当前模型尚未配置可用的图片生成协议")
+            provider["api_key"] = validate_http_api_key(provider["api_key"])
+            supplied_parameters, input_references = split_generation_parameters(task.parameters)
+            parameters = frozen_generation_parameters(supplied_parameters, provider)
+            validate_provider_input_support(provider, input_references)
+            effective_prompt = effective_generation_prompt("image", task.prompt, input_references)
+            validate_required_provider_prompt(provider, effective_prompt, input_references)
+            image_references = [
+                reference for reference in input_references if reference.get("kind") == "image"
+            ]
+            staged_images = []
+            if image_references:
+                form_parameters = multipart_scalar_parameters(parameters)
+                _, image_field_name = image_edit_transport(provider, len(image_references))
+                remaining_bytes = settings.generation_input_images_max_total_bytes
+                for ordinal, reference in enumerate(image_references):
+                    staged = _stage_edit_image(
+                        db,
+                        task,
+                        reference,
+                        Path(input_temp_dir.name),
+                        remaining_bytes,
+                        ordinal,
+                    )
+                    staged_images.append(staged[:3])
+                    remaining_bytes -= staged[3]
+            else:
+                provider_prompt("", input_references)
+                form_parameters = {}
+                image_field_name = "image"
+            task.parameters = stored_generation_parameters(parameters, input_references)
+            task.prompt = effective_prompt
+
+        is_edit = bool(image_references)
+        endpoint = (
+            image_edit_endpoint(provider["base_url"], provider["metadata"])
+            if is_edit
+            else image_generation_endpoint(provider["base_url"], provider["metadata"])
+        )
+        timeout = httpx.Timeout(
+            settings.provider_read_timeout_seconds,
+            connect=settings.provider_connect_timeout_seconds,
+        )
+        if not mark_provider_started(task_id, lease_token):
+            return
+        provider_started = True
+        with lease_heartbeat(task_id, lease_token) as lease_lost:
+            with provider_http_client(timeout) as client, ExitStack() as file_stack:
+                request_kwargs = (
+                    {
+                        "headers": {"Authorization": f"Bearer {provider['api_key']}"},
+                        "data": {
+                            "model": provider["model_name"],
+                            "prompt": effective_prompt,
+                            **form_parameters,
+                        },
+                        "files": [
+                            (
+                                image_field_name,
+                                (filename, file_stack.enter_context(path.open("rb")), mime_type),
+                            )
+                            for path, mime_type, filename in staged_images
+                        ],
+                    }
+                    if is_edit
+                    else {
+                        "headers": {
+                            "Authorization": f"Bearer {provider['api_key']}",
+                            "Content-Type": "application/json",
+                        },
+                        "json": {
+                            "model": provider["model_name"],
+                            "prompt": effective_prompt,
+                            **parameters,
+                        },
+                    }
+                )
+                _stream_provider_response_to_file(client, endpoint, spool_path, **request_kwargs)
+            if lease_lost.is_set():
+                spool_path.unlink(missing_ok=True)
+                return
+        with SessionLocal.begin() as db:
+            task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+            if task is None:
+                spool_path.unlink(missing_ok=True)
+                return
+            task.execution_phase = "image_result_processing"
+            task.temporary_result_path = str(spool_path)
+            task.result = {**(task.result or {}), "provider_response_received": True}
+            _release_task_lease(task)
+    except ProviderHTTPError as error:
+        spool_path.unlink(missing_ok=True)
+        if error.retryable:
+            retry_task(task_id, lease_token, str(error))
+        else:
+            fail_task(task_id, lease_token, str(error))
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        spool_path.unlink(missing_ok=True)
+        retry_task(task_id, lease_token, "连接模型供应商失败")
+    except httpx.HTTPError:
+        spool_path.unlink(missing_ok=True)
+        fail_task(
+            task_id,
+            lease_token,
+            "供应商连接中断，结果未知，请重新发起",
+            outcome_unknown=provider_started,
+        )
+    except (DomainValidationError, ProviderGenerationError) as error:
+        spool_path.unlink(missing_ok=True)
+        fail_task(task_id, lease_token, str(error))
+    except Exception:
+        spool_path.unlink(missing_ok=True)
+        logger.exception("Image provider request %s failed", task_id)
+        fail_task(
+            task_id,
+            lease_token,
+            "图片生成服务发生内部错误",
+            outcome_unknown=provider_started,
+        )
+    finally:
+        input_temp_dir.cleanup()
+
+
+def process_image_result(task_id: UUID, lease_token: UUID) -> None:
+    """Decode/download and persist one already-received image provider response."""
+    written_objects: list[tuple[object, str]] = []
+    spool_path: Path | None = None
+    terminal = False
+    try:
+        with SessionLocal.begin() as db:
+            task = GenerationTaskRepository(db).leased_task(task_id, lease_token)
+            if task is None or task.execution_phase != "image_result_processing":
+                return
+            owner_id, project_id = task.owner_id, task.project_id
+            provider = ModelCatalogService(db).resolve_provider_configuration(
+                owner_id, UUID(task.model)
+            )
+            provider["api_key"] = validate_http_api_key(provider["api_key"])
+            supplied_parameters, _ = split_generation_parameters(task.parameters)
+            parameters = frozen_generation_parameters(supplied_parameters, provider)
+            spool_path = _validated_spool_path(task.temporary_result_path)
+        body = spool_path.read_bytes()
+        if len(body) > settings.provider_response_max_bytes:
+            raise ProviderGenerationError("供应商响应超过大小限制")
+        payload = _provider_json_payload(body)
+        if not isinstance(payload, dict):
+            raise ProviderGenerationError("供应商响应格式无效")
+        items = payload.get("data")
+        if not isinstance(items, list) or not items:
+            raise ProviderGenerationError("供应商响应中没有图片结果")
+        if len(items) > settings.provider_max_outputs:
+            raise ProviderGenerationError("供应商返回的图片数量超过限制")
+        width, height = _parse_size(parameters)
+        storage = generation_asset_storage()
+        prepared_outputs = []
+        timeout = httpx.Timeout(
+            settings.provider_read_timeout_seconds,
+            connect=settings.provider_connect_timeout_seconds,
+        )
+        with lease_heartbeat(task_id, lease_token) as lease_lost:
+            with provider_http_client(timeout) as client:
+                for ordinal, item in enumerate(items):
+                    if not isinstance(item, dict):
+                        raise ProviderGenerationError("供应商图片结果格式无效")
+                    if isinstance(item.get("b64_json"), str):
+                        data = _decode_base64_image(item["b64_json"])
+                        declared_type = None
+                    elif isinstance(item.get("url"), str):
+                        data, declared_type = _download_image(client, item["url"])
+                    else:
+                        raise ProviderGenerationError("供应商图片结果缺少 url 或 b64_json")
+                    mime_type, extension = _image_format(data, declared_type)
+                    storage_key = storage.object_key(
+                        f"{owner_id}/{project_id}/{task_id}/{lease_token}-{ordinal}.{extension}"
+                    )
+                    storage.put_object(storage_key, data, mime_type)
+                    written_objects.append((storage, storage_key))
+                    prepared_outputs.append(
+                        (ordinal, item, data, mime_type, extension, storage_key)
+                    )
+            if lease_lost.is_set():
+                _cleanup_written_objects(written_objects)
+                return
+        with SessionLocal.begin() as db:
+            task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+            if task is None:
+                _cleanup_written_objects(written_objects)
+                return
+            for ordinal, item, data, mime_type, extension, storage_key in prepared_outputs:
+                asset = Asset(
+                    owner_id=owner_id,
+                    project_id=project_id,
+                    kind="image",
+                    source="generation",
+                    original_name=f"{provider['model_name']}-{ordinal}.{extension}",
+                    storage_key=storage_key,
+                    mime_type=mime_type,
+                    byte_size=len(data),
+                    width=width,
+                    height=height,
+                    checksum_sha256=hashlib.sha256(data).hexdigest(),
+                    status="ready",
+                    asset_metadata={
+                        **storage_metadata(storage),
+                        "model_id": str(provider["model_id"]),
+                        "model_name": provider["model_name"],
+                        "revised_prompt": item.get("revised_prompt"),
+                        "generation_lease_token": str(lease_token),
+                    },
+                )
+                db.add(asset)
+                db.flush()
+                db.add(GenerationOutput(generation_task_id=task.id, asset_id=asset.id, ordinal=ordinal))
+            task.status = "succeeded"
+            task.execution_phase = "succeeded"
+            task.result = _safe_result(payload, len(items))
+            task.completed_at = datetime.now(timezone.utc)
+            task.temporary_result_path = None
+            _release_task_lease(task)
+            terminal = True
+    except (httpx.HTTPError, AssetStorageError) as error:
+        _cleanup_written_objects(written_objects)
+        logger.warning("Image result %s will retry after local/provider download error", task_id)
+        terminal = _retry_image_result(task_id, lease_token, str(error))
+    except (DomainValidationError, ResourceNotFoundError, ProviderGenerationError, ValueError) as error:
+        _cleanup_written_objects(written_objects)
+        fail_task(task_id, lease_token, str(error))
+        terminal = True
+    except Exception as error:
+        _cleanup_written_objects(written_objects)
+        logger.exception("Image result %s failed", task_id)
+        terminal = _retry_image_result(
+            task_id,
+            lease_token,
+            f"图片结果处理失败: {type(error).__name__}",
+        )
+    finally:
+        if terminal and spool_path is not None:
+            spool_path.unlink(missing_ok=True)
+
+
+def cleanup_orphaned_image_spool_files() -> int:
+    root = _image_spool_dir()
+    now = datetime.now(timezone.utc).timestamp()
+    cleanup_grace_seconds = max(
+        60.0,
+        float(settings.provider_read_timeout_seconds) + float(settings.generation_lease_seconds),
+    )
+    with SessionLocal() as db:
+        referenced = {
+            str(Path(value).resolve())
+            for value in db.scalars(
+                select(GenerationTask.temporary_result_path).where(
+                    GenerationTask.status == "running",
+                    GenerationTask.execution_phase == "image_result_processing",
+                    GenerationTask.temporary_result_path.is_not(None),
+                )
+            )
+            if value
+        }
+    removed = 0
+    for path in root.iterdir():
+        if not path.is_file():
+            continue
+        is_orphan = path.suffix == ".part" or str(path.resolve()) not in referenced
+        if not is_orphan:
+            continue
+        try:
+            age_seconds = now - path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if age_seconds < cleanup_grace_seconds:
+            continue
+        path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
+def video_poll_delay_seconds(submitted_at: datetime, now: datetime | None = None) -> float:
+    current = now or datetime.now(timezone.utc)
+    elapsed = max(0.0, (current - submitted_at).total_seconds())
+    base = 5.0 if elapsed < 120 else 15.0 if elapsed < 600 else 30.0
+    return base + random.uniform(0, 2)
+
+
+def _provider_error_backoff(error_count: int) -> float:
+    return min(
+        settings.provider_retry_max_delay_seconds,
+        max(5, 2 ** min(6, error_count + 1)),
+    ) + random.uniform(0, 2)
+
+
+def _reschedule_video_poll(
+    task_id: UUID,
+    lease_token: UUID,
+    *,
+    delay_seconds: float,
+    error: str | None = None,
+    result: dict | None = None,
+) -> None:
+    with SessionLocal.begin() as db:
+        task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+        if task is None:
+            return
+        task.execution_phase = "video_provider_processing"
+        task.next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        if result is not None:
+            task.result = result
+        if error:
+            task.poll_error_count += 1
+            task.last_provider_error = error.strip()[:2000]
+            task.error = error.strip()[:2000]
+        else:
+            task.error = None
+            task.last_provider_error = None
+        _release_task_lease(task)
+
+
+def _video_provider_context(task_id: UUID, lease_token: UUID) -> dict | None:
+    with SessionLocal.begin() as db:
+        task = GenerationTaskRepository(db).leased_task(task_id, lease_token)
+        if task is None or task.kind != "video":
+            return None
+        owner_id, project_id = task.owner_id, task.project_id
+        provider = ModelCatalogService(db).resolve_provider_configuration(
+            owner_id, UUID(task.model)
+        )
+        provider["api_key"] = validate_http_api_key(provider["api_key"])
+        supplied_parameters, input_references = split_generation_parameters(task.parameters)
+        parameters = frozen_generation_parameters(supplied_parameters, provider)
+        effective_prompt = effective_generation_prompt("video", task.prompt, input_references)
+        validate_video_input_references(provider.get("metadata"), input_references)
+        validate_video_prompt(provider.get("metadata"), effective_prompt)
+        task.parameters = stored_generation_parameters(parameters, input_references)
+        task.prompt = effective_prompt
+        refs_by_kind: dict[str, list[str]] = {"image": [], "video": [], "audio": []}
+        for reference in input_references:
+            if reference.get("kind") not in refs_by_kind:
+                continue
+            asset = db.get(Asset, UUID(str(reference.get("asset_id"))))
+            if asset is None or asset.owner_id != owner_id or asset.project_id != project_id:
+                raise ProviderGenerationError("视频参考素材不可用")
+            refs_by_kind[reference["kind"]].append(_asset_reference_url(asset))
+        return {
+            "owner_id": owner_id,
+            "project_id": project_id,
+            "provider": provider,
+            "parameters": parameters,
+            "prompt": effective_prompt,
+            "references": refs_by_kind,
+            "provider_task_id": task.provider_task_id,
+            "provider_submitted_at": task.provider_submitted_at,
+            "provider_deadline_at": task.provider_deadline_at,
+            "poll_error_count": task.poll_error_count,
+            "result": task.result or {},
+        }
+
+
+def process_video_submission(task_id: UUID, lease_token: UUID) -> None:
+    """Create one provider-side video task, then release the submit slot."""
+    provider_started = False
+    try:
+        context = _video_provider_context(task_id, lease_token)
+        if context is None:
+            return
+        if context["provider_task_id"]:
+            _reschedule_video_poll(task_id, lease_token, delay_seconds=0)
+            return
+        provider = context["provider"]
+        endpoint = video_endpoint(provider["base_url"], provider.get("metadata") or {})
+        headers = {
+            "Authorization": f"Bearer {provider['api_key']}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Idempotency-Key": str(task_id),
+            "User-Agent": "JJboneTv-video-worker/2.0",
+        }
+        payload_body = {
+            "model": provider["model_name"],
+            "prompt": context["prompt"],
+            **context["parameters"],
+            **(
+                {"referenceImages": context["references"]["image"]}
+                if context["references"]["image"]
+                else {}
+            ),
+            **(
+                {"referenceVideos": context["references"]["video"]}
+                if context["references"]["video"]
+                else {}
+            ),
+            **(
+                {"referenceAudios": context["references"]["audio"]}
+                if context["references"]["audio"]
+                else {}
+            ),
+        }
+        timeout = httpx.Timeout(
+            settings.provider_read_timeout_seconds,
+            connect=settings.provider_connect_timeout_seconds,
+        )
+        if not mark_provider_started(task_id, lease_token):
+            return
+        provider_started = True
+        with lease_heartbeat(task_id, lease_token) as lease_lost:
+            with provider_http_client(timeout) as client:
+                payload = _provider_video_create_response(
+                    client, endpoint, headers=headers, json=payload_body
+                )
+            if lease_lost.is_set():
+                return
+        provider_task_id = _video_task_id(payload)
+        if not provider_task_id:
+            raise ProviderGenerationError("供应商未返回视频任务 ID")
+        submitted_at = datetime.now(timezone.utc)
+        with SessionLocal.begin() as db:
+            task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+            if task is None:
+                return
+            task.provider_task_id = provider_task_id
+            task.provider_submitted_at = submitted_at
+            task.provider_deadline_at = submitted_at + timedelta(
+                seconds=settings.video_provider_timeout_seconds
+            )
+            task.next_poll_at = submitted_at + timedelta(
+                seconds=video_poll_delay_seconds(submitted_at, submitted_at)
+            )
+            task.execution_phase = "video_provider_processing"
+            task.result = {"provider_status": _video_status(payload)}
+            task.error = None
+            _release_task_lease(task)
+    except ProviderHTTPError as error:
+        if error.retryable:
+            retry_task(task_id, lease_token, str(error))
+        else:
+            fail_task(task_id, lease_token, str(error))
+    except httpx.ConnectError:
+        retry_task(task_id, lease_token, "连接视频模型供应商失败")
+    except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.HTTPError):
+        fail_task(
+            task_id,
+            lease_token,
+            "视频创建请求结果未知，已停止自动重试",
+            outcome_unknown=provider_started,
+        )
+    except (DomainValidationError, ResourceNotFoundError, ProviderGenerationError, ValueError) as error:
+        fail_task(task_id, lease_token, str(error))
+    except Exception:
+        logger.exception("Video submission %s failed", task_id)
+        fail_task(
+            task_id,
+            lease_token,
+            "视频创建服务发生内部错误",
+            outcome_unknown=provider_started,
+        )
+
+
+def process_video_poll(task_id: UUID, lease_token: UUID) -> None:
+    """Perform exactly one status query and release the poll slot."""
+    temp_dir = tempfile.TemporaryDirectory(prefix=f"jjbonetv-video-{task_id}-")
+    written_objects: list[tuple[object, str]] = []
+    poll_error_count = 0
+    try:
+        context = _video_provider_context(task_id, lease_token)
+        if context is None:
+            return
+        poll_error_count = int(context.get("poll_error_count") or 0)
+        provider_task_id = context["provider_task_id"]
+        submitted_at = context["provider_submitted_at"] or datetime.now(timezone.utc)
+        deadline = context["provider_deadline_at"] or (
+            submitted_at + timedelta(seconds=settings.video_provider_timeout_seconds)
+        )
+        now = datetime.now(timezone.utc)
+        if now >= deadline:
+            fail_task(
+                task_id,
+                lease_token,
+                "视频供应商处理超过 60 分钟，结果未知，请重新发起",
+                outcome_unknown=True,
+            )
+            return
+        provider = context["provider"]
+        status_url = video_endpoint(
+            provider["base_url"], provider.get("metadata") or {}, f"/{provider_task_id}"
+        )
+        content_url = video_endpoint(
+            provider["base_url"],
+            provider.get("metadata") or {},
+            f"/{provider_task_id}/content",
+        )
+        headers = {
+            "Authorization": f"Bearer {provider['api_key']}",
+            "Accept": "application/json",
+            "User-Agent": "JJboneTv-video-worker/2.0",
+        }
+        timeout = httpx.Timeout(
+            settings.video_poll_read_timeout_seconds,
+            connect=settings.video_poll_connect_timeout_seconds,
+        )
+        with lease_heartbeat(task_id, lease_token) as lease_lost:
+            with provider_http_client(timeout) as client:
+                with client.stream("GET", status_url, headers=headers) as response:
+                    body = _limited_response_bytes(
+                        response, settings.provider_response_max_bytes, "视频任务状态"
+                    )
+                    if not response.is_success:
+                        raise ProviderHTTPError(
+                            _provider_error(response.status_code, body),
+                            retryable=response.status_code in {429, 502, 503, 504},
+                        )
+                status_payload = _provider_video_status_response(response, body)
+                status_value = _video_status(status_payload)
+                if status_value in {"failed", "error", "cancelled", "canceled"}:
+                    raise ProviderGenerationError(
+                        str(
+                            status_payload.get("error")
+                            or status_payload.get("message")
+                            or "视频生成失败"
+                        )
+                    )
+                if status_value not in {"completed", "succeeded", "success", "done"}:
+                    _reschedule_video_poll(
+                        task_id,
+                        lease_token,
+                        delay_seconds=video_poll_delay_seconds(submitted_at),
+                        result={**status_payload, "provider_status": status_value},
+                    )
+                    return
+                destination = Path(temp_dir.name) / "output.mp4"
+                total = _download_video_content(
+                    client,
+                    content_url,
+                    destination,
+                    {
+                        "Authorization": f"Bearer {provider['api_key']}",
+                        "Accept": "video/mp4,application/octet-stream,application/json",
+                        "User-Agent": "JJboneTv-video-worker/2.0",
+                    },
+                )
+            if lease_lost.is_set():
+                return
+        if total == 0:
+            raise ProviderGenerationError("供应商返回了空视频")
+        try:
+            inspected_video = inspect_media_file(destination, "video")
+        except MediaProbeError as error:
+            raise ProviderGenerationError("供应商返回的视频文件无效") from error
+        storage = generation_asset_storage()
+        storage_key = storage.object_key(
+            f"{context['owner_id']}/{context['project_id']}/{task_id}-{provider_task_id}.mp4"
+        )
+        storage.put_file(storage_key, destination, "video/mp4")
+        written_objects.append((storage, storage_key))
+        with SessionLocal.begin() as db:
+            task = GenerationTaskRepository(db).leased_task(task_id, lease_token, lock=True)
+            if task is None:
+                _cleanup_written_objects(written_objects)
+                return
+            asset = Asset(
+                owner_id=context["owner_id"],
+                project_id=context["project_id"],
+                kind="video",
+                source="generation",
+                original_name=f"{provider['model_name']}.mp4",
+                storage_key=storage_key,
+                mime_type="video/mp4",
+                byte_size=total,
+                width=inspected_video.width,
+                height=inspected_video.height,
+                duration_ms=inspected_video.duration_ms,
+                status="ready",
+                asset_metadata={
+                    **storage_metadata(storage),
+                    "model_id": str(provider["model_id"]),
+                    "model_name": provider["model_name"],
+                    "provider_task_id": provider_task_id,
+                },
+            )
+            db.add(asset)
+            db.flush()
+            db.add(GenerationOutput(generation_task_id=task.id, asset_id=asset.id, ordinal=0))
+            task.status = "succeeded"
+            task.execution_phase = "succeeded"
+            task.result = {
+                **(task.result or {}),
+                "provider_status": "completed",
+                "output_count": 1,
+            }
+            task.completed_at = datetime.now(timezone.utc)
+            task.next_poll_at = None
+            task.error = None
+            _release_task_lease(task)
+    except ProviderHTTPError as error:
+        _cleanup_written_objects(written_objects)
+        _reschedule_video_poll(
+            task_id,
+            lease_token,
+            delay_seconds=_provider_error_backoff(poll_error_count),
+            error=str(error),
+        )
+    except (httpx.HTTPError, AssetStorageError) as error:
+        _cleanup_written_objects(written_objects)
+        _reschedule_video_poll(
+            task_id,
+            lease_token,
+            delay_seconds=_provider_error_backoff(poll_error_count),
+            error=str(error),
+        )
+    except ProviderGenerationError as error:
+        _cleanup_written_objects(written_objects)
+        fail_task(task_id, lease_token, str(error))
+    except Exception as error:
+        _cleanup_written_objects(written_objects)
+        logger.exception("Video poll %s failed", task_id)
+        _reschedule_video_poll(
+            task_id,
+            lease_token,
+            delay_seconds=min(settings.provider_retry_max_delay_seconds, 30),
+            error=f"视频状态查询失败: {type(error).__name__}",
+        )
+    finally:
+        temp_dir.cleanup()
 
 
 def _process_video_generation_task(task_id: UUID, lease_token: UUID) -> None:
