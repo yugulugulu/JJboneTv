@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     model_api_base_url: str = ""
     model_api_key: str = ""
     jwt_secret: str = "change-me-in-production"
-    jwt_expire_minutes: int = 60
+    jwt_expire_minutes: int = 1440
     auth_cookie_secure: bool = False
     admin_jwt_secret: str = "change-me-admin-in-production"
     admin_jwt_expire_minutes: int = 60
