@@ -245,12 +245,16 @@ def test_base64_limit_is_checked_before_decode(monkeypatch):
 
 def test_image_download_uses_bounded_stream(monkeypatch):
     monkeypatch.setattr(settings, "generated_asset_max_bytes", 8)
+    monkeypatch.setattr(
+        "app.services.generation_provider._validate_image_download_url",
+        lambda value: value,
+    )
 
     class Client:
         @contextmanager
         def stream(self, method, url, **kwargs):
             assert method == "GET"
-            assert kwargs == {"follow_redirects": True}
+            assert kwargs == {"follow_redirects": False}
             yield StreamOnlyResponse(
                 [b"\x89PNG\r\n\x1a\n"], {"content-type": "image/png"}
             )

@@ -580,9 +580,9 @@ def _url_origin(url: str) -> tuple[str, str, int]:
     )
 
 
-def _validate_video_redirect_url(url: str) -> str:
+def _validate_download_url(url: str, *, media_label: str) -> str:
     if not isinstance(url, str) or not url.strip() or len(url) > VIDEO_DOWNLOAD_MAX_URL_LENGTH:
-        raise ProviderGenerationError("供应商返回了无效的视频下载重定向")
+        raise ProviderGenerationError(f"供应商返回了无效的{media_label}下载地址")
     candidate = url.strip()
     parsed = urlparse(candidate)
     if (
@@ -591,25 +591,25 @@ def _validate_video_redirect_url(url: str) -> str:
         or parsed.username is not None
         or parsed.password is not None
     ):
-        raise ProviderGenerationError("供应商返回了不安全的视频下载重定向")
+        raise ProviderGenerationError(f"供应商返回了不安全的{media_label}下载地址")
     try:
         port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     except ValueError as error:
-        raise ProviderGenerationError("供应商返回了无效的视频下载重定向") from error
+        raise ProviderGenerationError(f"供应商返回了无效的{media_label}下载地址") from error
 
     try:
         hostname = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
     except UnicodeError as error:
-        raise ProviderGenerationError("供应商返回了无效的视频下载重定向") from error
+        raise ProviderGenerationError(f"供应商返回了无效的{media_label}下载地址") from error
     if hostname == "localhost" or hostname.endswith(".localhost"):
-        raise ProviderGenerationError("供应商视频下载重定向指向受限地址")
+        raise ProviderGenerationError(f"供应商{media_label}下载地址指向受限地址")
     try:
         literal_addresses = [ipaddress.ip_address(hostname)]
     except ValueError:
         try:
             resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
         except OSError as error:
-            raise ProviderGenerationError("供应商视频下载重定向地址无法解析") from error
+            raise ProviderGenerationError(f"供应商{media_label}下载地址无法解析") from error
         literal_addresses = []
         for item in resolved:
             try:
@@ -619,7 +619,7 @@ def _validate_video_redirect_url(url: str) -> str:
             if address not in literal_addresses:
                 literal_addresses.append(address)
         if not literal_addresses:
-            raise ProviderGenerationError("供应商视频下载重定向地址无法解析")
+            raise ProviderGenerationError(f"供应商{media_label}下载地址无法解析")
     restricted_addresses = [
         address for address in literal_addresses if not address.is_global
     ]
@@ -634,8 +634,16 @@ def _validate_video_redirect_url(url: str) -> str:
         )
     )
     if restricted_addresses and not trusted_r2_fake_ip:
-        raise ProviderGenerationError("供应商视频下载重定向指向受限地址")
+        raise ProviderGenerationError(f"供应商{media_label}下载地址指向受限地址")
     return candidate
+
+
+def _validate_video_redirect_url(url: str) -> str:
+    return _validate_download_url(url, media_label="视频")
+
+
+def _validate_image_download_url(url: str) -> str:
+    return _validate_download_url(url, media_label="图片")
 
 
 def _download_video_content(
@@ -757,17 +765,28 @@ def _image_format(data: bytes, declared: str | None = None) -> tuple[str, str]:
 
 
 def _download_image(client: httpx.Client, url: str) -> tuple[bytes, str | None]:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ProviderGenerationError("供应商返回了无效的图片地址")
-    with client.stream("GET", url, follow_redirects=True) as response:
-        data = _limited_response_bytes(
-            response, settings.generated_asset_max_bytes, "供应商返回的图片"
-        )
-        if not response.is_success:
-            raise ProviderGenerationError(f"下载供应商图片失败 ({response.status_code})")
-        declared = response.headers.get("content-type", "").split(";", 1)[0]
-        return data, declared
+    current_url = _validate_image_download_url(url)
+    redirects_followed = 0
+
+    while True:
+        with client.stream("GET", current_url, follow_redirects=False) as response:
+            if response.status_code in VIDEO_DOWNLOAD_REDIRECT_CODES:
+                if redirects_followed >= VIDEO_DOWNLOAD_MAX_REDIRECTS:
+                    raise ProviderGenerationError("供应商图片下载重定向次数过多")
+                location = response.headers.get("location")
+                if not location:
+                    raise ProviderGenerationError("供应商图片下载重定向缺少 Location")
+                current_url = _validate_image_download_url(urljoin(current_url, location))
+                redirects_followed += 1
+                continue
+
+            data = _limited_response_bytes(
+                response, settings.generated_asset_max_bytes, "供应商返回的图片"
+            )
+            if not response.is_success:
+                raise ProviderGenerationError(f"下载供应商图片失败 ({response.status_code})")
+            declared = response.headers.get("content-type", "").split(";", 1)[0]
+            return data, declared
 
 
 def _provider_body_text(body: bytes) -> str:
