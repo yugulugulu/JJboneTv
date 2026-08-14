@@ -46,6 +46,8 @@ from .generation_provider import (
     validate_provider_input_support,
     validate_required_provider_prompt,
 )
+from .video_model_options import validate_video_input_references, validate_video_prompt
+from .media_probe import MediaProbeError, inspect_media_file
 from ..schemas import (
     AssetCreate,
     AssetUpdate,
@@ -159,6 +161,22 @@ class ImageUploadStorageError(Exception):
     pass
 
 
+class MediaUploadTooLargeError(Exception):
+    pass
+
+
+class UnsupportedMediaTypeError(Exception):
+    pass
+
+
+class InvalidMediaError(Exception):
+    pass
+
+
+class MediaUploadStorageError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class SpoolImageResult:
     path: Path
@@ -175,6 +193,11 @@ class SpoolImageResult:
 class ImageUploadCreationResult:
     asset: Asset
     replayed: bool
+
+
+@dataclass(frozen=True)
+class MediaUploadResult:
+    asset: Asset
 
 
 @dataclass(frozen=True)
@@ -764,6 +787,142 @@ class ProjectDomainService:
         finally:
             spooled.path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _spool_media(upload: UploadFile, kind: str) -> tuple[Path, int, str, str]:
+        limits = {
+            "image": settings.user_image_upload_max_bytes,
+            "video": settings.user_video_upload_max_bytes,
+            "audio": settings.user_audio_upload_max_bytes,
+        }
+        if kind not in limits:
+            raise DomainValidationError("Unsupported upload media kind")
+        content_type = (upload.content_type or "").split(";", 1)[0].strip().lower()
+        extension = Path(upload.filename or "").suffix.lower()
+        allowed_types = {
+            "image": {"image/jpeg", "image/png", "image/webp", "image/gif"},
+            "video": {
+                "video/mp4",
+                "video/webm",
+                "video/quicktime",
+                "video/x-m4v",
+                "video/mpeg",
+            },
+            "audio": {
+                "audio/mpeg",
+                "audio/mp3",
+                "audio/wav",
+                "audio/x-wav",
+            },
+        }
+        # Some browsers report local video/audio files as an empty MIME type or
+        # application/octet-stream. Use the extension only as a transport
+        # fallback; the media probe below still validates the actual contents.
+        if not content_type or content_type == "application/octet-stream":
+            extension_types = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+                ".mp4": "video/mp4",
+                ".webm": "video/webm",
+                ".mov": "video/quicktime",
+                ".m4v": "video/x-m4v",
+                ".mpeg": "video/mpeg",
+                ".mp3": "audio/mpeg",
+                ".wav": "audio/wav",
+            }
+            content_type = extension_types.get(extension, content_type)
+        if content_type not in allowed_types.get(kind, set()):
+            raise UnsupportedMediaTypeError
+        if not extension or len(extension) > 12 or any(ch in extension for ch in "/\\"):
+            extension = f".{kind}"
+        digest = hashlib.sha256()
+        size = 0
+        temporary = tempfile.NamedTemporaryFile(prefix=f"thinktv-{kind}-", suffix=".upload", delete=False)
+        path = Path(temporary.name)
+        try:
+            upload.file.seek(0)
+            while True:
+                chunk = upload.file.read(IMAGE_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limits[kind]:
+                    raise MediaUploadTooLargeError
+                digest.update(chunk)
+                temporary.write(chunk)
+            temporary.flush()
+            if size == 0:
+                raise DomainValidationError("Uploaded file is empty")
+            return path, size, digest.hexdigest(), content_type
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            temporary.close()
+
+    def upload_media_asset(
+        self,
+        owner_id: UUID,
+        project_id: UUID,
+        kind: str,
+        upload: UploadFile,
+    ) -> MediaUploadResult:
+        if kind not in {"image", "video", "audio"}:
+            raise DomainValidationError("Unsupported upload media kind")
+        path, byte_size, checksum, mime_type = self._spool_media(upload, kind)
+        storage = None
+        storage_key = None
+        try:
+            project = self.repo.lock_project(project_id, owner_id)
+            if project is None:
+                raise ResourceNotFoundError
+            try:
+                inspected = (
+                    inspect_media_file(path, kind)
+                    if kind in {"video", "audio"}
+                    else None
+                )
+            except MediaProbeError as error:
+                raise InvalidMediaError(str(error)) from error
+            storage = generation_asset_storage()
+            extension = Path(upload.filename or "").suffix.lower() or f".{kind}"
+            storage_key = storage.object_key(
+                f"{owner_id}/{project_id}/{uuid.uuid4()}{extension}"
+            )
+            storage.put_file(storage_key, path, mime_type)
+            asset = Asset(
+                owner_id=owner_id,
+                project_id=project_id,
+                kind=kind,
+                source="upload",
+                original_name=self._safe_upload_name(upload.filename, extension),
+                storage_key=storage_key,
+                mime_type=mime_type,
+                byte_size=byte_size,
+                width=inspected.width if inspected is not None else None,
+                height=inspected.height if inspected is not None else None,
+                duration_ms=inspected.duration_ms if inspected is not None else None,
+                checksum_sha256=checksum,
+                status="ready",
+                asset_metadata=storage_metadata(storage),
+            )
+            self.db.add(asset)
+            self._commit()
+            self.db.refresh(asset)
+            return MediaUploadResult(asset)
+        except (AssetStorageError, ValueError) as error:
+            self.db.rollback()
+            if storage is not None and storage_key is not None:
+                try:
+                    storage.delete_object(storage_key)
+                except Exception:
+                    logger.exception("Unable to clean up uploaded media %s", storage_key)
+            raise MediaUploadStorageError from error
+        finally:
+            path.unlink(missing_ok=True)
+
     def save_image_edit(
         self,
         owner_id: UUID,
@@ -1100,7 +1259,7 @@ class ProjectDomainService:
             raise DomainValidationError(
                 "Generation input_node_ids must exactly match every direct predecessor in workflow edge order"
             )
-        if payload.kind in {"image", "video", "audio"} and not direct_predecessors:
+        if payload.kind in {"image", "audio"} and not direct_predecessors:
             raise DomainValidationError(
                 "Media generation target must have at least one direct predecessor"
             )
@@ -1108,6 +1267,10 @@ class ProjectDomainService:
             "text" if nodes[input_id].get("type") == "prompt" else nodes[input_id].get("type")
             for input_id in direct_predecessors
         ]
+        if payload.kind == "video" and "text" in direct_predecessor_kinds:
+            raise DomainValidationError(
+                "invalid-input: Video generation does not accept a text predecessor; enter the prompt in the video node"
+            )
         if payload.kind == "image":
             if direct_predecessor_kinds.count("image") > 5:
                 raise DomainValidationError(
@@ -1161,6 +1324,11 @@ class ProjectDomainService:
                     "mime_type": asset.mime_type,
                     "byte_size": asset.byte_size,
                     "ordinal": ordinal,
+                    **(
+                        {"duration_ms": asset.duration_ms}
+                        if node_kind in {"video", "audio"}
+                        else {}
+                    ),
                 }
             )
         return references
@@ -1234,12 +1402,16 @@ class ProjectDomainService:
         if provider["kind"] != payload.kind:
             raise DomainValidationError("Generation kind must match the selected model")
         parameters = normalize_generation_parameters(provider, payload.parameters)
+        if payload.kind == "video":
+            validate_video_input_references(provider.get("metadata"), input_references)
         validate_provider_input_support(provider, input_references)
         if image_references:
             multipart_scalar_parameters(parameters)
         effective_prompt = effective_generation_prompt(
             payload.kind, payload.prompt, input_references
         )
+        if payload.kind == "video":
+            validate_video_prompt(provider.get("metadata"), effective_prompt)
         validate_required_provider_prompt(provider, effective_prompt, input_references)
         task = GenerationTask(
             owner_id=owner_id,
@@ -1252,7 +1424,7 @@ class ProjectDomainService:
             parameters=stored_generation_parameters(parameters, input_references),
             idempotency_key=idempotency_key,
             request_hash=request_hash,
-            max_attempts=settings.generation_max_attempts,
+            max_attempts=settings.provider_retry_max_attempts,
             result={},
         )
         self.db.add(task)
@@ -1398,7 +1570,7 @@ class ProjectDomainService:
             parameters=stored_generation_parameters(parameters, input_references),
             idempotency_key=idempotency_key,
             request_hash=request_hash,
-            max_attempts=settings.generation_max_attempts,
+            max_attempts=settings.provider_retry_max_attempts,
             result={},
         )
         try:

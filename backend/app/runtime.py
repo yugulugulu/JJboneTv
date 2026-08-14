@@ -107,6 +107,34 @@ def _validate_provider_limits(errors: list[str], config: Settings) -> None:
     )
     _validate_range(
         errors,
+        "USER_VIDEO_UPLOAD_MAX_BYTES",
+        config.user_video_upload_max_bytes,
+        1024,
+        1024 * 1024 * 1024,
+    )
+    _validate_range(
+        errors,
+        "USER_AUDIO_UPLOAD_MAX_BYTES",
+        config.user_audio_upload_max_bytes,
+        1024,
+        512 * 1024 * 1024,
+    )
+    _validate_range(
+        errors,
+        "GENERATED_VIDEO_ASSET_MAX_BYTES",
+        config.generated_video_asset_max_bytes,
+        1024,
+        1024 * 1024 * 1024,
+    )
+    _validate_range(
+        errors,
+        "PROVIDER_VIDEO_POLL_SECONDS",
+        config.provider_video_poll_seconds,
+        1,
+        300,
+    )
+    _validate_range(
+        errors,
         "GENERATION_INPUT_IMAGES_MAX_TOTAL_BYTES",
         config.generation_input_images_max_total_bytes,
         1024,
@@ -121,6 +149,37 @@ def _validate_provider_limits(errors: list[str], config: Settings) -> None:
             "PROVIDER_RESPONSE_MAX_BYTES 必须至少容纳一个最大资产的 Base64 编码"
         )
     _validate_range(errors, "PROVIDER_MAX_OUTPUTS", config.provider_max_outputs, 1, 16)
+
+
+def _validate_worker_concurrency(errors: list[str], config: Settings) -> None:
+    for name, value, maximum in (
+        ("IMAGE_ACTIVE_WINDOW", config.image_active_window, 1000),
+        ("IMAGE_PROVIDER_CONCURRENCY", config.image_provider_concurrency, 100),
+        ("IMAGE_RESULT_CONCURRENCY", config.image_result_concurrency, 100),
+        ("USER_IMAGE_ACTIVE_LIMIT", config.user_image_active_limit, 100),
+        ("VIDEO_ACTIVE_LIMIT", config.video_active_limit, 1000),
+        ("VIDEO_SUBMIT_CONCURRENCY", config.video_submit_concurrency, 100),
+        ("VIDEO_POLL_CONCURRENCY", config.video_poll_concurrency, 100),
+        ("USER_VIDEO_ACTIVE_LIMIT", config.user_video_active_limit, 100),
+        ("VIDEO_PROVIDER_TIMEOUT_SECONDS", config.video_provider_timeout_seconds, 86400),
+        ("VIDEO_POLL_CONNECT_TIMEOUT_SECONDS", config.video_poll_connect_timeout_seconds, 120),
+        ("VIDEO_POLL_READ_TIMEOUT_SECONDS", config.video_poll_read_timeout_seconds, 600),
+        ("PROVIDER_RETRY_MAX_ATTEMPTS", config.provider_retry_max_attempts, 10),
+        ("PROVIDER_RETRY_MAX_DELAY_SECONDS", config.provider_retry_max_delay_seconds, 3600),
+    ):
+        _validate_range(errors, name, value, 1, maximum)
+    if config.image_provider_concurrency > config.image_active_window:
+        errors.append("IMAGE_PROVIDER_CONCURRENCY 不能大于 IMAGE_ACTIVE_WINDOW")
+    if config.image_result_concurrency > config.image_active_window:
+        errors.append("IMAGE_RESULT_CONCURRENCY 不能大于 IMAGE_ACTIVE_WINDOW")
+    if config.user_image_active_limit > config.image_active_window:
+        errors.append("USER_IMAGE_ACTIVE_LIMIT 不能大于 IMAGE_ACTIVE_WINDOW")
+    if config.video_submit_concurrency > config.video_active_limit:
+        errors.append("VIDEO_SUBMIT_CONCURRENCY 不能大于 VIDEO_ACTIVE_LIMIT")
+    if config.video_poll_concurrency > config.video_active_limit:
+        errors.append("VIDEO_POLL_CONCURRENCY 不能大于 VIDEO_ACTIVE_LIMIT")
+    if config.user_video_active_limit > config.video_active_limit:
+        errors.append("USER_VIDEO_ACTIVE_LIMIT 不能大于 VIDEO_ACTIVE_LIMIT")
 
 
 def _validate_trusted_proxies(errors: list[str], value: str) -> None:
@@ -167,10 +226,27 @@ def _validate_bootstrap(errors: list[str], config: Settings) -> None:
 def validate_runtime_settings(role: str, config: Settings = settings) -> None:
     if role not in {"user-api", "admin-api", "worker", "migration"}:
         raise RuntimeConfigurationError(f"未知运行时角色：{role}")
+    errors: list[str] = []
+    _validate_range(errors, "DATABASE_POOL_SIZE", config.database_pool_size, 1, 20)
+    _validate_range(errors, "DATABASE_MAX_OVERFLOW", config.database_max_overflow, 0, 20)
+    if role == "worker":
+        _validate_worker_concurrency(errors, config)
+        _validate_range(
+            errors, "GENERATION_WORKER_POLL_SECONDS", config.generation_worker_poll_seconds, 0.1, 60
+        )
+        _validate_range(
+            errors, "GENERATION_LEASE_SECONDS", config.generation_lease_seconds, 10, 3600
+        )
+        _validate_range(
+            errors, "GENERATION_HEARTBEAT_SECONDS", config.generation_heartbeat_seconds, 1, 600
+        )
+        if config.generation_heartbeat_seconds >= config.generation_lease_seconds:
+            errors.append("GENERATION_HEARTBEAT_SECONDS 必须小于 GENERATION_LEASE_SECONDS")
+    if errors:
+        raise RuntimeConfigurationError("运行配置校验失败：" + "；".join(dict.fromkeys(errors)))
     if config.app_environment.strip().lower() != "production":
         return
 
-    errors: list[str] = []
     _validate_database_url(errors, config.database_url)
     if role == "user-api":
         _validate_secrets(
@@ -198,19 +274,8 @@ def validate_runtime_settings(role: str, config: Settings = settings) -> None:
         _validate_storage(errors, config)
         _validate_provider_limits(errors, config)
         _validate_range(
-            errors, "GENERATION_WORKER_POLL_SECONDS", config.generation_worker_poll_seconds, 0.1, 60
-        )
-        _validate_range(
-            errors, "GENERATION_LEASE_SECONDS", config.generation_lease_seconds, 10, 3600
-        )
-        _validate_range(
-            errors, "GENERATION_HEARTBEAT_SECONDS", config.generation_heartbeat_seconds, 1, 600
-        )
-        _validate_range(
             errors, "GENERATION_MAX_ATTEMPTS", config.generation_max_attempts, 1, 10
         )
-        if config.generation_heartbeat_seconds >= config.generation_lease_seconds:
-            errors.append("GENERATION_HEARTBEAT_SECONDS 必须小于 GENERATION_LEASE_SECONDS")
     if role == "admin-api":
         _validate_secrets(errors, (("ADMIN_JWT_SECRET", config.admin_jwt_secret),))
         if not config.admin_cookie_secure:

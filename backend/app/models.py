@@ -98,6 +98,7 @@ class ModelGroup(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    runtime_limits: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_by_admin_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -464,6 +465,7 @@ class GenerationTask(Base):
         ),
         Index("ix_generations_project_node_created", "project_id", "node_id", text("created_at DESC")),
         Index("ix_generations_claim", "status", "next_attempt_at", "created_at"),
+        Index("ix_generations_phase_poll", "execution_phase", "next_poll_at", "created_at"),
         Index("ix_generations_expired_lease", "status", "lease_expires_at"),
         UniqueConstraint("owner_id", "idempotency_key", name="uq_generations_owner_idempotency"),
         CheckConstraint("attempt_count >= 0", name="ck_generations_attempt_count"),
@@ -497,7 +499,21 @@ class GenerationTask(Base):
     provider_request_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    provider_slot_reserved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     provider_task_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    execution_phase: Mapped[str] = mapped_column(String(48), nullable=False, default="queued")
+    provider_submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    poll_error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_provider_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    temporary_result_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     result: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

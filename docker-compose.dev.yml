@@ -1,5 +1,9 @@
 services:
   # Development-only overrides. Keep docker-compose.yml production-oriented.
+  migration:
+    volumes:
+      - ./backend:/app
+
   backend:
     command:
       - sh
@@ -11,11 +15,22 @@ services:
     environment:
       WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}
 
-  worker:
+  image-worker:
     command:
       - sh
       - -c
-      - python -m app.runtime validate worker && exec watchfiles --filter python 'python -m app.worker' /app/app
+      - python -m app.runtime validate worker && exec watchfiles --filter python 'python -m app.worker --role image' /app/app
+    volumes:
+      - ./backend:/app
+      - generated_assets:/app/storage/generated
+    environment:
+      WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}
+
+  video-worker:
+    command:
+      - sh
+      - -c
+      - python -m app.runtime validate worker && exec watchfiles --filter python 'python -m app.worker --role video' /app/app
     volumes:
       - ./backend:/app
       - generated_assets:/app/storage/generated

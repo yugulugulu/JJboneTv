@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..dependencies.auth import get_current_user
 from ..exceptions import (
+    DomainValidationError,
     IdempotencyConflictError,
     ResourceNotFoundError,
     RevisionConflictError,
@@ -61,7 +62,11 @@ from ..services.project_domain import (
     ImageUploadStorageError,
     ImageUploadTooLargeError,
     InvalidImageError,
+    InvalidMediaError,
+    MediaUploadStorageError,
+    MediaUploadTooLargeError,
     ProjectDomainService,
+    UnsupportedMediaTypeError,
     UnsupportedImageTypeError,
 )
 
@@ -351,6 +356,77 @@ def upload_project_image(
 
 
 @router.post(
+    "/projects/{project_id}/assets/media",
+    response_model=AssetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_project_media(
+    project_id: UUID,
+    kind: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    domain: ProjectDomainService = Depends(service),
+):
+    """Stream a user media upload with type-specific limits.
+
+    Images keep the existing specialized endpoint; this endpoint is intended for
+    audio/video uploads and enforces 20/200/50 MiB limits server-side.
+    """
+    try:
+        return domain.upload_media_asset(current_user.id, project_id, kind, file).asset
+    except MediaUploadTooLargeError:
+        limits = {"image": "20MB", "video": "200MB", "audio": "50MB"}
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "message": f"{kind} exceeds the configured upload size limit ({limits.get(kind, 'configured limit')})",
+                "code": "FILE_TOO_LARGE",
+            },
+        ) from None
+    except UnsupportedMediaTypeError:
+        expected = "MP3 or WAV audio file" if kind == "audio" else f"{kind}/* media file"
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail={"message": f"Expected a {expected}", "code": "UNSUPPORTED_MEDIA_TYPE"},
+        ) from None
+    except InvalidMediaError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"message": str(error), "code": "INVALID_MEDIA"},
+        ) from None
+    except MediaUploadStorageError:
+        logger.exception("Unable to store uploaded %s for project %s", kind, project_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": "Media storage is temporarily unavailable", "code": "UPLOAD_FAILED"},
+        ) from None
+    except DomainValidationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": str(error), "code": "INVALID_UPLOAD"},
+        ) from None
+
+
+@router.post(
+    "/projects/{project_id}/assets/{kind}",
+    response_model=AssetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_project_media_by_kind(
+    project_id: UUID,
+    kind: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    domain: ProjectDomainService = Depends(service),
+):
+    """Path-based alias accepting both singular and plural media names."""
+    normalized_kind = {"images": "image", "videos": "video", "audios": "audio"}.get(
+        kind.strip().lower(), kind.strip().lower()
+    )
+    return upload_project_media(project_id, normalized_kind, file, current_user, domain)
+
+
+@router.post(
     "/projects/{project_id}/nodes/{node_id}/image-edit",
     response_model=ImageEditRead,
     status_code=status.HTTP_201_CREATED,
@@ -545,6 +621,38 @@ def get_asset_content(
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@router.get("/assets/{asset_id}/signed-url")
+def get_asset_signed_url(
+    asset_id: UUID,
+    current_user: User = Depends(get_current_user),
+    domain: ProjectDomainService = Depends(service),
+):
+    """Return a short-lived, authenticated URL for copying an OSS asset link.
+
+    The storage key is intentionally kept server-side.  Local development
+    storage falls back to the authenticated content endpoint.
+    """
+
+    asset = domain.get_asset(current_user.id, asset_id)
+    if asset.kind == "text" or asset.status != "ready" or not asset.storage_key:
+        raise ResourceNotFoundError
+    try:
+        storage = storage_for_asset(asset.asset_metadata)
+        storage.validate_project_key(asset.storage_key, asset.owner_id, asset.project_id)
+        metadata = asset.asset_metadata if isinstance(asset.asset_metadata, dict) else {}
+        if isinstance(storage, LocalAssetStorage) or metadata.get("storage_backend") == "local":
+            return {"url": f"/api/assets/{asset.id}/content"}
+        return {"url": storage.signed_get_url(asset.storage_key)}
+    except ValueError:
+        raise ResourceNotFoundError from None
+    except AssetStorageError:
+        logger.exception("Unable to create signed URL for asset %s", asset.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Asset storage is temporarily unavailable",
+        ) from None
 
 
 @router.patch("/assets/{asset_id}", response_model=AssetRead)

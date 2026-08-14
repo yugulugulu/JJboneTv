@@ -19,6 +19,33 @@ def claim_next_task(worker_id: str) -> GenerationTask | None:
         return task
 
 
+def _claim_detached(method_name: str, worker_id: str) -> GenerationTask | None:
+    with SessionLocal.begin() as db:
+        task = getattr(GenerationTaskRepository(db), method_name)(worker_id)
+        if task is None:
+            return None
+        db.flush()
+        db.refresh(task)
+        db.expunge(task)
+        return task
+
+
+def claim_image_request_task(worker_id: str) -> GenerationTask | None:
+    return _claim_detached("claim_image_request", worker_id)
+
+
+def claim_image_result_task(worker_id: str) -> GenerationTask | None:
+    return _claim_detached("claim_image_result", worker_id)
+
+
+def claim_video_submit_task(worker_id: str) -> GenerationTask | None:
+    return _claim_detached("claim_video_submit", worker_id)
+
+
+def claim_video_poll_task(worker_id: str) -> GenerationTask | None:
+    return _claim_detached("claim_video_poll", worker_id)
+
+
 def claim_specific_task(task_id: UUID, worker_id: str) -> GenerationTask | None:
     with SessionLocal.begin() as db:
         task = GenerationTaskRepository(db).claim_specific(task_id, worker_id)
